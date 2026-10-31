@@ -2,6 +2,7 @@
 
 mod app;
 pub mod ffi;
+mod store;
 
 pub use app::*;
 pub use crux_core::Core;

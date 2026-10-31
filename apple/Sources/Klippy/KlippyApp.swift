@@ -6,7 +6,7 @@ struct KlippyApp: App {
 
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     /// Shared by the main and Settings windows.
-    @StateObject private var core = Core()
+    @StateObject private var core = Core(storePath: Core.defaultStorePath())
     @StateObject private var launchAtLogin = LaunchAtLogin()
 
     var body: some Scene {
@@ -27,7 +27,7 @@ struct KlippyApp: App {
         .defaultSize(width: 900, height: 600)
 
         MenuBarExtra {
-            TrayMenu()
+            TrayMenu(core: core)
         } label: {
             Image(nsImage: TrayMenu.icon)
         }

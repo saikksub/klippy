@@ -26,14 +26,15 @@ struct CoreTests {
         #expect(core.view.clipboardAccess == "")
 
         core.update(.start)
+        #expect(core.view.unlocked)
         #expect(core.view.page == (core.view.clipboardAccess == "true" ? .home : .setup))
         #expect(["true", "false"].contains(core.view.clipboardAccess))
     }
 
     @Test func searchFiltersCopiedText() {
         let core = Core()
-        core.update(.copied(ClipboardSnapshot(content: ClipboardContent(text: "Hello world", formats: []))))
-        core.update(.copied(ClipboardSnapshot(content: ClipboardContent(text: "goodbye", formats: []))))
+        core.update(.copied(ClipboardSnapshot(content: ClipboardContent(text: "Hello world", formats: []), copiedAtMs: 1)))
+        core.update(.copied(ClipboardSnapshot(content: ClipboardContent(text: "goodbye", formats: []), copiedAtMs: 2)))
         #expect(core.view.items.map(\.preview) == ["goodbye", "Hello world"])
 
         core.update(.search("hello"))

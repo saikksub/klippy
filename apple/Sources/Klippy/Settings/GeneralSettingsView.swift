@@ -39,6 +39,33 @@ struct GeneralSettingsView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
+            // Saved in the encrypted history, so only editable once unlocked.
+            .disabled(!core.view.unlocked)
+
+            Section {
+                LabeledContent("Delete items older than") {
+                    HStack(spacing: 6) {
+                        TextField("Amount", value: retentionAmount, format: .number)
+                            .labelsHidden()
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 64)
+                        Stepper("Amount", value: retentionAmount, in: 1...Int(core.view.retentionMaxAmount))
+                            .labelsHidden()
+                        Picker("Unit", selection: retentionUnit) {
+                            Text("Minutes").tag(RetentionUnit.minutes)
+                            Text("Hours").tag(RetentionUnit.hours)
+                            Text("Days").tag(RetentionUnit.days)
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                    }
+                }
+            } footer: {
+                Text(core.view.retentionHint + " Up to 365 days.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .disabled(!core.view.unlocked)
 
             Section {
                 LabeledContent("Notifications") {
@@ -70,6 +97,21 @@ struct GeneralSettingsView: View {
         case false?: "Off"
         case nil: "Not asked yet"
         }
+    }
+
+    /// The core limits it to 1 minute … 365 days, so out-of-range typing snaps back.
+    private var retentionAmount: Binding<Int> {
+        Binding(
+            get: { Int(core.view.retentionAmount) },
+            set: { core.update(.setRetention(amount: UInt32(clamping: $0), unit: core.view.retentionUnit)) }
+        )
+    }
+
+    private var retentionUnit: Binding<RetentionUnit> {
+        Binding(
+            get: { core.view.retentionUnit },
+            set: { core.update(.setRetention(amount: core.view.retentionAmount, unit: $0)) }
+        )
     }
 
     private var trigger: Binding<UInt32> {

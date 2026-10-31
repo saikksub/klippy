@@ -1,13 +1,32 @@
+import App
 import AppKit
 import SwiftUI
 
 /// The menu bar ("tray") menu.
 struct TrayMenu: View {
+    @ObservedObject var core: Core
     @Environment(\.openWindow) private var openWindow
+
+    /// Menu items don't truncate, so keep long copies to one short line.
+    private static let titleLength = 50
 
     var body: some View {
         Button("Show Klippy") { show(KlippyApp.mainWindowID) }
-        Button("History") { show(HistoryView.windowID) }
+        // Only once Touch ID has unlocked the history.
+        if core.view.unlocked {
+            Menu("History") {
+                if core.view.recentItems.isEmpty {
+                    Text("Nothing copied yet")
+                }
+                // The newest items only: menus build every row up front, so
+                // the full history lives in the History window.
+                ForEach(core.view.recentItems, id: \.id) { item in
+                    Button(Self.title(item.preview)) { core.update(.copyItem(item.id)) }
+                }
+                Divider()
+                Button("Show All History…") { show(HistoryView.windowID) }
+            }
+        }
         Divider()
         SettingsLink {
             Text("Settings…")
@@ -21,6 +40,10 @@ struct TrayMenu: View {
     private func show(_ windowID: String) {
         openWindow(id: windowID)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private static func title(_ preview: String) -> String {
+        preview.count > titleLength ? String(preview.prefix(titleLength - 1)) + "…" : preview
     }
 
     /// Paperclip outline from apple/Assets/tray.svg (Solar by 480 Design,

@@ -11,11 +11,45 @@ final class Core: ObservableObject {
     private var clipboardWatcher: Task<Void, Never>?
     private var watchActivity: NSObjectProtocol?
     private var lastChangeCount = 0
+    private let inMemory: Bool
+    private var expiryTimer: Task<Void, Never>?
 
-    init() {
+    /// `storePath` is the encrypted history file; nil keeps history in memory
+    /// and skips Touch ID (for tests).
+    init(storePath: String? = nil) {
         core = CoreFfi()
+        inMemory = storePath == nil
         // swiftlint:disable:next force_try
         view = try! .bincodeDeserialize(input: [UInt8](core.view()))
+        if let storePath {
+            update(.setStorePath(storePath))
+            startExpiryTimer()
+        }
+    }
+
+    /// ~/Library/Application Support/Klippy/history.sqlite, in a folder only
+    /// this user can read.
+    static func defaultStorePath() -> String {
+        let folder = URL.applicationSupportDirectory.appending(path: "Klippy", directoryHint: .isDirectory)
+        try? FileManager.default.createDirectory(
+            at: folder,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        return folder.appending(path: "history.sqlite").path(percentEncoded: false)
+    }
+
+    /// Unix time in milliseconds.
+    private static var nowMs: UInt64 { UInt64(Date().timeIntervalSince1970 * 1000) }
+
+    /// Lets the core delete items older than the retention setting.
+    private func startExpiryTimer() {
+        expiryTimer = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(15))
+                self?.update(.deleteExpired(nowMs: Self.nowMs))
+            }
+        }
     }
 
     func update(_ event: Event) {
@@ -81,6 +115,23 @@ final class Core: ObservableObject {
         case .render:
             // swiftlint:disable:next force_try
             view = try! .bincodeDeserialize(input: [UInt8](core.view()))
+        case .unlock:
+            if inMemory {
+                // Tests: nothing on disk to protect, so no Touch ID.
+                let result = UnlockResult(key: [UInt8](repeating: 0, count: 32), error: "", nowMs: Self.nowMs)
+                // swiftlint:disable:next force_try
+                processEffects(core.resolve(id: request.id, data: Data(try! result.bincodeSerialize())))
+                return
+            }
+            let id = request.id
+            Task {
+                let result = switch await HistoryKey.unlock() {
+                case let .success(key): UnlockResult(key: key, error: "", nowMs: Self.nowMs)
+                case let .failure(failure): UnlockResult(key: nil, error: failure.message, nowMs: Self.nowMs)
+                }
+                // swiftlint:disable:next force_try
+                processEffects(core.resolve(id: id, data: Data(try! result.bincodeSerialize())))
+            }
         case .clipboardAccess:
             let access = ClipboardAccess(granted: Self.canReadClipboard())
             // swiftlint:disable:next force_try
@@ -93,7 +144,7 @@ final class Core: ObservableObject {
                 processEffects(core.resolve(id: id, data: Data(try! permission.bincodeSerialize())))
             }
         case .clipboardRead:
-            let snapshot = ClipboardSnapshot(content: Self.readClipboard())
+            let snapshot = ClipboardSnapshot(content: Self.readClipboard(), copiedAtMs: Self.nowMs)
             // swiftlint:disable:next force_try
             processEffects(core.resolve(id: request.id, data: Data(try! snapshot.bincodeSerialize())))
         case let .clipboardWrite(write):

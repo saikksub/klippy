@@ -10,6 +10,8 @@ struct ContentView: View {
         case .splash:
             SplashView()
                 .task { core.update(.start) }
+        case .locked:
+            LockedView(core: core)
         case .setup:
             SetupView()
         case .home:

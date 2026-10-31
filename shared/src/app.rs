@@ -7,11 +7,18 @@ use crux_core::{
 use facet::Facet;
 use serde::{Deserialize, Serialize};
 
+use crate::store::{KEY_BYTES, Store};
+
 #[derive(Facet, Serialize, Deserialize, Clone, Debug)]
 #[repr(C)]
 pub enum Event {
-    /// Sent by the shell once the splash screen is up.
+    /// Sent by the shell before `Start`: where the encrypted history lives.
+    /// Without it (e.g. in tests) history is kept in memory only.
+    SetStorePath(String),
+    /// Sent by the shell once the splash screen is up, and again from the
+    /// Locked page to retry.
     Start,
+    Unlocked(UnlockResult),
     ClipboardAccessChecked(ClipboardAccess),
     /// The user's answer to the notification permission prompt (or the stored
     /// answer on later launches).
@@ -37,6 +44,15 @@ pub enum Event {
     Search(String),
     /// How many quick copies add the clipboard to the history (1 to 4).
     SetCopyTrigger(u32),
+    /// Delete items not copied again within this long (1 minute to 365 days).
+    SetRetention {
+        amount: u32,
+        unit: RetentionUnit,
+    },
+    /// Sent by the shell periodically; `now_ms` is unix time in milliseconds.
+    DeleteExpired {
+        now_ms: u64,
+    },
     Increment,
     Decrement,
     Reset,
@@ -48,9 +64,73 @@ pub enum Event {
 pub enum Page {
     #[default]
     Splash,
+    /// Touch ID was cancelled or failed; history stays encrypted.
+    Locked,
     /// Shown instead of `Home` when the app can't read the clipboard.
     Setup,
     Home,
+}
+
+#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub enum RetentionUnit {
+    Minutes,
+    Hours,
+    #[default]
+    Days,
+}
+
+impl RetentionUnit {
+    const fn minutes(self) -> u64 {
+        match self {
+            Self::Minutes => 1,
+            Self::Hours => 60,
+            Self::Days => 60 * 24,
+        }
+    }
+
+    /// The largest amount in this unit that stays within 365 days.
+    const fn max_amount(self) -> u32 {
+        #[allow(clippy::cast_possible_truncation)]
+        let max = (MAX_RETENTION_MINUTES / self.minutes()) as u32;
+        max
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Minutes => "minutes",
+            Self::Hours => "hours",
+            Self::Days => "days",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        [Self::Minutes, Self::Hours, Self::Days]
+            .into_iter()
+            .find(|unit| unit.name() == name)
+    }
+}
+
+const MAX_RETENTION_MINUTES: u64 = 365 * 24 * 60;
+const DEFAULT_RETENTION_DAYS: u32 = 30;
+
+/// Asks the shell to authenticate the user (Touch ID, or their password) and
+/// return the history's encryption key from the Keychain.
+#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Unlock;
+
+#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UnlockResult {
+    /// The 32-byte key, or `None` if authentication failed or was cancelled.
+    pub key: Option<Vec<u8>>,
+    /// Why there's no key, for the Locked page.
+    pub error: String,
+    /// Unix time in milliseconds, to clear out expired items on unlock.
+    pub now_ms: u64,
+}
+
+impl Operation for Unlock {
+    type Output = UnlockResult;
 }
 
 /// Asks the shell whether the app may read the clipboard without prompting.
@@ -106,6 +186,8 @@ pub struct ClipboardRead;
 pub struct ClipboardSnapshot {
     /// `None` if the clipboard had no text or was marked private.
     pub content: Option<ClipboardContent>,
+    /// Unix time in milliseconds when it was read.
+    pub copied_at_ms: u64,
 }
 
 impl Operation for ClipboardRead {
@@ -126,6 +208,7 @@ impl Operation for ClipboardWrite {
 #[derive(Debug)]
 pub enum Effect {
     Render(RenderOperation),
+    Unlock(Unlock),
     ClipboardAccess(ClipboardAccessCheck),
     NotificationPermission(NotificationPermissionRequest),
     ClipboardRead(ClipboardRead),
@@ -137,6 +220,10 @@ pub enum Effect {
 /// the item, so one huge copy can't exhaust memory.
 const MAX_ITEM_BYTES: usize = 10 * 1024 * 1024;
 
+/// How many of the newest items the tray menu lists; menus aren't
+/// virtualised, so the rest are reached through "Show All History…".
+const TRAY_ITEMS: usize = 20;
+
 const DEFAULT_COPY_TRIGGER: u32 = 3;
 const MAX_COPY_TRIGGER: u32 = 4;
 
@@ -146,24 +233,27 @@ fn copy_window_ms(copy_trigger: u32) -> u64 {
     500 + 500 * u64::from(copy_trigger)
 }
 
-struct Clip {
-    id: u64,
-    content: ClipboardContent,
-}
-
 pub struct Model {
     page: Page,
+    store_path: Option<String>,
+    /// In memory until unlocked, then the encrypted file.
+    store: Store,
+    unlocked: bool,
+    unlock_error: String,
     clipboard_access: Option<bool>,
     notifications_allowed: Option<bool>,
-    /// Newest first, no duplicates.
-    history: Vec<Clip>,
-    next_id: u64,
+    /// The lists as last read from the store (ids and previews only).
+    items: Vec<ClipItem>,
+    history_items: Vec<ClipItem>,
+    recent_items: Vec<ClipItem>,
+    selected: Option<SelectedClip>,
     /// Timestamps of recent clipboard changes, for spotting a triple copy.
     recent_copies: Vec<u64>,
     copy_trigger: u32,
+    retention_amount: u32,
+    retention_unit: RetentionUnit,
     search: String,
     history_search: String,
-    selected: Option<u64>,
     count: isize,
 }
 
@@ -171,17 +261,61 @@ impl Default for Model {
     fn default() -> Self {
         Self {
             page: Page::default(),
+            store_path: None,
+            store: Store::in_memory(),
+            unlocked: false,
+            unlock_error: String::new(),
             clipboard_access: None,
             notifications_allowed: None,
-            history: Vec::new(),
-            next_id: 0,
+            items: Vec::new(),
+            history_items: Vec::new(),
+            recent_items: Vec::new(),
+            selected: None,
             recent_copies: Vec::new(),
             copy_trigger: DEFAULT_COPY_TRIGGER,
+            retention_amount: DEFAULT_RETENTION_DAYS,
+            retention_unit: RetentionUnit::Days,
             search: String::new(),
             history_search: String::new(),
-            selected: None,
             count: 0,
         }
+    }
+}
+
+impl Model {
+    fn retention_ms(&self) -> u64 {
+        u64::from(self.retention_amount) * self.retention_unit.minutes() * 60 * 1000
+    }
+
+    /// Re-reads the lists (and drops a selection that no longer exists).
+    fn refresh(&mut self) {
+        self.items = logged(self.store.list(&self.search)).unwrap_or_default();
+        self.history_items = logged(self.store.list(&self.history_search)).unwrap_or_default();
+        self.recent_items = logged(self.store.recent(TRAY_ITEMS)).unwrap_or_default();
+        if let Some(selected) = &self.selected
+            && !logged(self.store.contains(selected.id)).unwrap_or(false)
+        {
+            self.selected = None;
+        }
+    }
+
+    fn load_settings(&mut self) {
+        let setting = |key| logged(self.store.setting(key)).flatten();
+        if let Some(trigger) = setting("copy_trigger").and_then(|v| v.parse().ok()) {
+            self.copy_trigger = clamp_trigger(trigger);
+        }
+        if let (Some(amount), Some(unit)) = (
+            setting("retention_amount").and_then(|v| v.parse().ok()),
+            setting("retention_unit").and_then(|v| RetentionUnit::from_name(&v)),
+        ) {
+            self.retention_unit = unit;
+            self.retention_amount = clamp_retention(amount, unit);
+        }
+    }
+
+    fn delete_expired(&mut self, now_ms: u64) -> bool {
+        let cutoff = now_ms.saturating_sub(self.retention_ms());
+        logged(self.store.delete_copied_before(cutoff)).unwrap_or(0) > 0
     }
 }
 
@@ -204,6 +338,10 @@ pub struct SelectedClip {
 #[derive(Facet, Serialize, Deserialize, Clone, Default)]
 pub struct ViewModel {
     pub page: Page,
+    /// Whether Touch ID has unlocked the history this launch.
+    pub unlocked: bool,
+    /// Why the history is locked, on `Page::Locked`.
+    pub unlock_error: String,
     /// "true" / "false" once checked, empty before.
     pub clipboard_access: String,
     /// `None` until the permission request has been answered.
@@ -212,12 +350,19 @@ pub struct ViewModel {
     pub copy_trigger: u32,
     /// Explains the current trigger, including its time window.
     pub copy_trigger_hint: String,
+    pub retention_amount: u32,
+    pub retention_unit: RetentionUnit,
+    /// The largest `retention_amount` allowed in `retention_unit`.
+    pub retention_max_amount: u32,
+    pub retention_hint: String,
     /// History items matching `search`, newest first.
     pub items: Vec<ClipItem>,
     pub history_search: String,
     /// History items matching `history_search`, for the History window.
     pub history_items: Vec<ClipItem>,
     pub selected: Option<SelectedClip>,
+    /// The newest items, unfiltered, for the tray menu.
+    pub recent_items: Vec<ClipItem>,
     pub count: String,
 }
 
@@ -230,9 +375,40 @@ impl App for Klippy {
     type ViewModel = ViewModel;
     type Effect = Effect;
 
+    #[allow(clippy::too_many_lines)]
     fn update(&self, event: Event, model: &mut Model) -> Command<Effect, Event> {
         match event {
+            Event::SetStorePath(path) => {
+                model.store_path = Some(path);
+                return Command::done();
+            }
             Event::Start => {
+                return Command::request_from_shell(Unlock).then_send(Event::Unlocked);
+            }
+            Event::Unlocked(result) => {
+                let key = result
+                    .key
+                    .and_then(|key| <[u8; KEY_BYTES]>::try_from(key).ok());
+                let Some(key) = key else {
+                    model.page = Page::Locked;
+                    model.unlock_error = result.error;
+                    return render();
+                };
+                if let Some(path) = &model.store_path {
+                    match Store::open(path, &key) {
+                        Ok(store) => model.store = store,
+                        Err(error) => {
+                            model.page = Page::Locked;
+                            model.unlock_error = format!("Couldn't open the history: {error}");
+                            return render();
+                        }
+                    }
+                }
+                model.unlocked = true;
+                model.unlock_error.clear();
+                model.load_settings();
+                model.delete_expired(result.now_ms);
+                model.refresh();
                 return Command::request_from_shell(ClipboardAccessCheck)
                     .then_send(Event::ClipboardAccessChecked);
             }
@@ -278,31 +454,60 @@ impl App for Klippy {
                     content
                         .formats
                         .retain(|format| format.data.len() <= MAX_ITEM_BYTES);
-                    add_to_history(model, content);
+                    logged(model.store.add(&content, snapshot.copied_at_ms));
+                    model.refresh();
                 }
                 _ => return Command::done(),
             },
             Event::CopyItem(id) => {
-                let Some(clip) = model.history.iter().find(|clip| clip.id == id) else {
+                let Some(content) = logged(model.store.content(id)).flatten() else {
                     return Command::done();
                 };
                 // The item keeps its place in the list.
-                return Command::notify_shell(ClipboardWrite {
-                    content: clip.content.clone(),
-                })
-                .into();
+                return Command::notify_shell(ClipboardWrite { content }).into();
             }
             Event::SelectItem(id) => {
-                if !model.history.iter().any(|clip| clip.id == id) {
+                let Some(content) = logged(model.store.content(id)).flatten() else {
+                    return Command::done();
+                };
+                model.selected = Some(SelectedClip {
+                    id,
+                    text: content.text,
+                    formats: content.formats,
+                });
+            }
+            Event::HistorySearch(search) => {
+                model.history_items = logged(model.store.list(&search)).unwrap_or_default();
+                model.history_search = search;
+            }
+            Event::Search(search) => {
+                model.items = logged(model.store.list(&search)).unwrap_or_default();
+                model.search = search;
+            }
+            Event::SetCopyTrigger(count) => {
+                model.copy_trigger = clamp_trigger(count);
+                model.recent_copies.clear();
+                logged(
+                    model
+                        .store
+                        .set_setting("copy_trigger", &model.copy_trigger.to_string()),
+                );
+            }
+            Event::SetRetention { amount, unit } => {
+                model.retention_unit = unit;
+                model.retention_amount = clamp_retention(amount, unit);
+                logged(
+                    model
+                        .store
+                        .set_setting("retention_amount", &model.retention_amount.to_string()),
+                );
+                logged(model.store.set_setting("retention_unit", unit.name()));
+            }
+            Event::DeleteExpired { now_ms } => {
+                if !model.delete_expired(now_ms) {
                     return Command::done();
                 }
-                model.selected = Some(id);
-            }
-            Event::HistorySearch(search) => model.history_search = search,
-            Event::Search(search) => model.search = search,
-            Event::SetCopyTrigger(count) => {
-                model.copy_trigger = count.clamp(1, MAX_COPY_TRIGGER);
-                model.recent_copies.clear();
+                model.refresh();
             }
             Event::Increment => model.count += 1,
             Event::Decrement => model.count -= 1,
@@ -315,6 +520,8 @@ impl App for Klippy {
     fn view(&self, model: &Model) -> ViewModel {
         ViewModel {
             page: model.page.clone(),
+            unlocked: model.unlocked,
+            unlock_error: model.unlock_error.clone(),
             notifications_allowed: model.notifications_allowed,
             clipboard_access: model
                 .clipboard_access
@@ -323,37 +530,33 @@ impl App for Klippy {
             search: model.search.clone(),
             copy_trigger: model.copy_trigger,
             copy_trigger_hint: copy_trigger_hint(model.copy_trigger),
-            items: items_matching(model, &model.search),
+            retention_amount: model.retention_amount,
+            retention_unit: model.retention_unit,
+            retention_max_amount: model.retention_unit.max_amount(),
+            retention_hint: retention_hint(model.retention_amount, model.retention_unit),
+            items: model.items.clone(),
             history_search: model.history_search.clone(),
-            history_items: items_matching(model, &model.history_search),
-            selected: model
-                .selected
-                .and_then(|id| model.history.iter().find(|clip| clip.id == id))
-                .map(|clip| SelectedClip {
-                    id: clip.id,
-                    text: clip.content.text.clone(),
-                    formats: clip.content.formats.clone(),
-                }),
+            history_items: model.history_items.clone(),
+            selected: model.selected.clone(),
+            recent_items: model.recent_items.clone(),
             count: format!("Count is: {}", model.count),
         }
     }
 }
 
-/// Adds to the top of the history. Content already there moves to the top,
-/// keeping the newest formats.
-fn add_to_history(model: &mut Model, content: ClipboardContent) {
-    let id = match model
-        .history
-        .iter()
-        .position(|clip| clip.content.text == content.text)
-    {
-        Some(index) => model.history.remove(index).id,
-        None => {
-            model.next_id += 1;
-            model.next_id
-        }
-    };
-    model.history.insert(0, Clip { id, content });
+/// Database errors are logged and the app carries on with what it has.
+fn logged<T>(result: rusqlite::Result<T>) -> Option<T> {
+    result
+        .inspect_err(|error| eprintln!("klippy: history store: {error}"))
+        .ok()
+}
+
+fn clamp_trigger(count: u32) -> u32 {
+    count.clamp(1, MAX_COPY_TRIGGER)
+}
+
+fn clamp_retention(amount: u32, unit: RetentionUnit) -> u32 {
+    amount.clamp(1, unit.max_amount())
 }
 
 fn copy_trigger_hint(copy_trigger: u32) -> String {
@@ -365,26 +568,13 @@ fn copy_trigger_hint(copy_trigger: u32) -> String {
     format!("Copy {copy_trigger} times within {seconds} seconds to add it to the history.")
 }
 
-fn items_matching(model: &Model, search: &str) -> Vec<ClipItem> {
-    model
-        .history
-        .iter()
-        .filter(|clip| matches_search(&clip.content.text, search))
-        .map(|clip| ClipItem {
-            id: clip.id,
-            preview: preview(&clip.content.text),
-        })
-        .collect()
-}
-
-fn matches_search(text: &str, search: &str) -> bool {
-    let search = search.trim();
-    search.is_empty() || text.to_lowercase().contains(&search.to_lowercase())
-}
-
-/// Collapses all whitespace (including newlines) so the text fits one line.
-fn preview(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+fn retention_hint(amount: u32, unit: RetentionUnit) -> String {
+    let unit = if amount == 1 {
+        unit.name().trim_end_matches('s')
+    } else {
+        unit.name()
+    };
+    format!("Items not copied again within {amount} {unit} are deleted.")
 }
 
 #[cfg(test)]
@@ -397,10 +587,195 @@ mod test {
         assert_eq!(Klippy.view(&model).page, Page::Splash);
     }
 
+    const KEY: [u8; KEY_BYTES] = [9; KEY_BYTES];
+
+    /// Runs `Start` through a successful Touch ID unlock, returning the
+    /// command that then asks for clipboard access.
+    fn start_and_unlock(model: &mut Model, now_ms: u64) -> Command<Effect, Event> {
+        let mut cmd = Klippy.update(Event::Start, model);
+        let mut request = cmd.expect_one_effect().expect_unlock();
+        request
+            .resolve(UnlockResult {
+                key: Some(KEY.to_vec()),
+                error: String::new(),
+                now_ms,
+            })
+            .unwrap();
+        let event = cmd.events().next().unwrap();
+        Klippy.update(event, model)
+    }
+
+    #[test]
+    fn start_asks_for_touch_id_and_stays_locked_without_it() {
+        let mut model = Model::default();
+        let mut cmd = Klippy.update(Event::Start, &mut model);
+        let mut request = cmd.expect_one_effect().expect_unlock();
+        request
+            .resolve(UnlockResult {
+                key: None,
+                error: "Cancelled".into(),
+                now_ms: 0,
+            })
+            .unwrap();
+        let event = cmd.events().next().unwrap();
+        Klippy.update(event, &mut model).expect_only_render();
+
+        let view = Klippy.view(&model);
+        assert_eq!(view.page, Page::Locked);
+        assert_eq!(view.unlock_error, "Cancelled");
+    }
+
+    #[test]
+    fn unlocking_opens_the_encrypted_file_with_saved_history_and_settings() {
+        let path = std::env::temp_dir().join(format!("klippy-app-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let launch = || {
+            let mut model = Model::default();
+            let _ = Klippy.update(
+                Event::SetStorePath(path.to_string_lossy().into()),
+                &mut model,
+            );
+            let _ = start_and_unlock(&mut model, 1_000);
+            model
+        };
+
+        let mut model = launch();
+        let _ = Klippy.update(copied("remember me"), &mut model);
+        let _ = Klippy.update(Event::SetCopyTrigger(2), &mut model);
+        let _ = Klippy.update(
+            Event::SetRetention {
+                amount: 6,
+                unit: RetentionUnit::Hours,
+            },
+            &mut model,
+        );
+        drop(model);
+
+        let model = launch();
+        let view = Klippy.view(&model);
+        assert_eq!(items(&model), ["remember me"]);
+        assert_eq!(view.copy_trigger, 2);
+        assert_eq!(
+            (view.retention_amount, view.retention_unit),
+            (6, RetentionUnit::Hours)
+        );
+        drop(model);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_wrong_key_keeps_the_history_locked() {
+        let path =
+            std::env::temp_dir().join(format!("klippy-wrongkey-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        drop(Store::open(&path, &[1; KEY_BYTES]).unwrap());
+
+        let mut model = Model::default();
+        let _ = Klippy.update(
+            Event::SetStorePath(path.to_string_lossy().into()),
+            &mut model,
+        );
+        let _ = start_and_unlock(&mut model, 0);
+        let view = Klippy.view(&model);
+        assert_eq!(view.page, Page::Locked);
+        assert!(view.unlock_error.starts_with("Couldn't open the history"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_tray_gets_the_newest_items_only_once_unlocked() {
+        let mut model = Model::default();
+        assert!(!Klippy.view(&model).unlocked);
+        let _ = start_and_unlock(&mut model, 0);
+        assert!(Klippy.view(&model).unlocked);
+
+        for i in 0..TRAY_ITEMS + 5 {
+            let _ = Klippy.update(copied(&format!("item {i}")), &mut model);
+        }
+        let _ = Klippy.update(Event::Search("item 1".into()), &mut model);
+        let recent = Klippy.view(&model).recent_items;
+        assert_eq!(recent.len(), TRAY_ITEMS);
+        assert_eq!(recent[0].preview, format!("item {}", TRAY_ITEMS + 4));
+    }
+
+    #[test]
+    fn retention_defaults_to_30_days_and_is_limited_to_365_days() {
+        let mut model = Model::default();
+        let view = Klippy.view(&model);
+        assert_eq!(
+            (view.retention_amount, view.retention_unit),
+            (30, RetentionUnit::Days)
+        );
+        assert_eq!(
+            view.retention_hint,
+            "Items not copied again within 30 days are deleted."
+        );
+
+        for (unit, max) in [
+            (RetentionUnit::Minutes, 525_600),
+            (RetentionUnit::Hours, 8_760),
+            (RetentionUnit::Days, 365),
+        ] {
+            let _ = Klippy.update(
+                Event::SetRetention {
+                    amount: u32::MAX,
+                    unit,
+                },
+                &mut model,
+            );
+            assert_eq!(Klippy.view(&model).retention_amount, max);
+            assert_eq!(Klippy.view(&model).retention_max_amount, max);
+        }
+        let _ = Klippy.update(
+            Event::SetRetention {
+                amount: 0,
+                unit: RetentionUnit::Minutes,
+            },
+            &mut model,
+        );
+        let view = Klippy.view(&model);
+        assert_eq!(view.retention_amount, 1);
+        assert_eq!(
+            view.retention_hint,
+            "Items not copied again within 1 minute are deleted."
+        );
+    }
+
+    #[test]
+    fn expired_items_are_deleted() {
+        let mut model = Model::default();
+        let _ = Klippy.update(
+            Event::SetRetention {
+                amount: 1,
+                unit: RetentionUnit::Minutes,
+            },
+            &mut model,
+        );
+        for (text, at) in [("old", 0), ("new", 50_000)] {
+            let _ = Klippy.update(
+                Event::Copied(ClipboardSnapshot {
+                    content: Some(ClipboardContent {
+                        text: text.into(),
+                        formats: vec![],
+                    }),
+                    copied_at_ms: at,
+                }),
+                &mut model,
+            );
+        }
+        Klippy
+            .update(Event::DeleteExpired { now_ms: 59_000 }, &mut model)
+            .expect_done();
+        Klippy
+            .update(Event::DeleteExpired { now_ms: 61_000 }, &mut model)
+            .expect_only_render();
+        assert_eq!(items(&model), ["new"]);
+    }
+
     #[test]
     fn start_checks_clipboard_access_then_shows_home() {
         let mut model = Model::default();
-        let mut cmd = Klippy.update(Event::Start, &mut model);
+        let mut cmd = start_and_unlock(&mut model, 0);
         let mut request = cmd.expect_one_effect().expect_clipboard_access();
         request.resolve(ClipboardAccess { granted: true }).unwrap();
 
@@ -417,6 +792,7 @@ mod test {
                 text: text.into(),
                 formats: vec![],
             }),
+            copied_at_ms: 0,
         })
     }
 
@@ -457,6 +833,7 @@ mod test {
         let _ = Klippy.update(
             Event::Copied(ClipboardSnapshot {
                 content: Some(content),
+                copied_at_ms: 0,
             }),
             &mut model,
         );
@@ -517,6 +894,7 @@ mod test {
         let _ = Klippy.update(
             Event::Copied(ClipboardSnapshot {
                 content: Some(content.clone()),
+                copied_at_ms: 0,
             }),
             &mut model,
         );
@@ -648,7 +1026,10 @@ mod test {
     fn a_triple_copy_without_text_adds_nothing() {
         let mut model = Model::default();
         let _ = Klippy.update(
-            Event::Copied(ClipboardSnapshot { content: None }),
+            Event::Copied(ClipboardSnapshot {
+                content: None,
+                copied_at_ms: 0,
+            }),
             &mut model,
         );
         assert!(items(&model).is_empty());
@@ -657,7 +1038,7 @@ mod test {
     #[test]
     fn start_shows_setup_when_clipboard_access_is_denied() {
         let mut model = Model::default();
-        let mut cmd = Klippy.update(Event::Start, &mut model);
+        let mut cmd = start_and_unlock(&mut model, 0);
         let mut request = cmd.expect_one_effect().expect_clipboard_access();
         request.resolve(ClipboardAccess { granted: false }).unwrap();
 
@@ -700,6 +1081,7 @@ mod test {
         let _ = Klippy.update(
             Event::Copied(ClipboardSnapshot {
                 content: Some(content.clone()),
+                copied_at_ms: 0,
             }),
             &mut model,
         );
