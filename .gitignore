@@ -1,0 +1,5 @@
+/target
+apple/generated
+apple/.build
+apple/build
+.DS_Store
