@@ -1,6 +1,7 @@
 APPLE   := apple
 GEN     := $(APPLE)/generated
 APP_DIR := $(APPLE)/build/Klippy.app
+ASSETS  := $(APPLE)/Assets
 CONFIG  ?= debug
 
 # With only the Command Line Tools (no Xcode), swift test needs to be told where Swift Testing lives
@@ -19,7 +20,7 @@ RUST_PROFILE := debug
 CARGO_FLAGS  :=
 endif
 
-.PHONY: all test typegen package generate build app run open clean
+.PHONY: all test typegen package generate build icon app run open clean
 
 all: app
 
@@ -51,11 +52,23 @@ generate: typegen package
 build: generate
 	cd $(APPLE) && swift build -c $(CONFIG)
 
+# Regenerate the committed AppIcon.icns from AppIcon.svg (every size macOS wants)
+icon:
+	rm -rf $(APPLE)/build/AppIcon.iconset
+	mkdir -p $(APPLE)/build/AppIcon.iconset
+	swiftc -O $(ASSETS)/render-icon.swift -o $(APPLE)/build/render-icon
+	for size in 16 32 128 256 512; do \
+		$(APPLE)/build/render-icon $(ASSETS)/AppIcon.svg $(APPLE)/build/AppIcon.iconset/icon_$${size}x$${size}.png $$size; \
+		$(APPLE)/build/render-icon $(ASSETS)/AppIcon.svg $(APPLE)/build/AppIcon.iconset/icon_$${size}x$${size}@2x.png $$((size * 2)); \
+	done
+	iconutil -c icns $(APPLE)/build/AppIcon.iconset -o $(ASSETS)/AppIcon.icns
+
 # Wrap the executable in a .app bundle
 app: build
 	rm -rf $(APP_DIR)
-	mkdir -p $(APP_DIR)/Contents/MacOS
+	mkdir -p $(APP_DIR)/Contents/MacOS $(APP_DIR)/Contents/Resources
 	cp $(APPLE)/Info.plist $(APP_DIR)/Contents/Info.plist
+	cp $(ASSETS)/AppIcon.icns $(APP_DIR)/Contents/Resources/AppIcon.icns
 	cp "$$(cd $(APPLE) && swift build -c $(CONFIG) --show-bin-path)/Klippy" $(APP_DIR)/Contents/MacOS/Klippy
 	codesign --force --sign - $(APP_DIR)
 
