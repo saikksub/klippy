@@ -72,7 +72,7 @@ struct HomeView: View {
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
-        .contentMargins(.top, 6, for: .scrollContent)
+        .contentMargins(.top, 14, for: .scrollContent)
         .contentMargins(.bottom, 16, for: .scrollContent)
         .overlay {
             // While searching, the info box above already says nothing was found.
@@ -120,10 +120,31 @@ struct HomeView: View {
         .help(core.view.copyTriggerHint)
     }
 
+    /// How many copies were rejected this session; opens them in History.
+    private var failedBadge: some View {
+        let count = core.view.failedItems.count
+        return Button {
+            core.update(.setHistoryTab(.failed))
+            openWindow(id: HistoryView.windowID)
+        } label: {
+            Label("\(count)", systemImage: "exclamationmark.shield.fill")
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background(Capsule().fill(Color.red.opacity(0.18)))
+                .foregroundStyle(.red)
+        }
+        .buttonStyle(.plain)
+        .help(count == 1 ? "1 copy failed to save" : "\(count) copies failed to save")
+    }
+
     private var bottomBar: some View {
         HStack {
             triggerBadge(.caption)
             Spacer()
+            if !core.view.failedItems.isEmpty {
+                failedBadge
+            }
             Menu {
                 SettingsLink {
                     Text("Settings…")

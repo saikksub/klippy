@@ -7,7 +7,12 @@ use crux_core::{
 use facet::Facet;
 use serde::{Deserialize, Serialize};
 
-use crate::store::{KEY_BYTES, Store};
+use std::collections::HashMap;
+
+use crate::{
+    clean,
+    store::{KEY_BYTES, Store, preview},
+};
 
 #[derive(Facet, Serialize, Deserialize, Clone, Debug)]
 #[repr(C)]
@@ -35,6 +40,11 @@ pub enum Event {
     },
     /// What the clipboard held after a triple copy.
     Copied(ClipboardSnapshot),
+    /// The shell downloaded a copy's remote images; finish preprocessing.
+    ImagesFetched {
+        snapshot: ClipboardSnapshot,
+        images: FetchedImages,
+    },
     /// The user clicked a history item to copy it again.
     CopyItem(u64),
     /// The user picked an item to view in the History window.
@@ -44,6 +54,15 @@ pub enum Event {
     Search(String),
     /// How many quick copies add the clipboard to the history (1 to 4).
     SetCopyTrigger(u32),
+    /// Deletes every saved item. The shell asks the user to confirm first.
+    ClearHistory,
+    /// Which list the History window's sidebar shows.
+    SetHistoryTab(HistoryTab),
+    SelectFailed(u64),
+    DismissFailed(u64),
+    DismissAllFailed,
+    /// Copies only the plain text of a failed copy, never its HTML.
+    CopyFailedText(u64),
     /// Delete items not copied again within this long (1 minute to 365 days).
     SetRetention {
         amount: u32,
@@ -70,6 +89,31 @@ pub enum Page {
     Setup,
     Home,
 }
+
+#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub enum HistoryTab {
+    #[default]
+    Saved,
+    /// Copies rejected as malicious this session.
+    Failed,
+}
+
+/// A copy that wasn't saved because it contained malicious content. Kept in
+/// memory only, so the list is gone when the app quits.
+#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct FailedCopy {
+    pub id: u64,
+    pub preview: String,
+    /// Only the plain text is kept; the dangerous HTML is discarded.
+    pub text: String,
+    pub reasons: Vec<String>,
+    /// Unix time in milliseconds.
+    pub failed_at_ms: u64,
+}
+
+/// At most this many failed copies are remembered per session.
+const MAX_FAILED: usize = 100;
 
 #[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
@@ -194,6 +238,34 @@ impl Operation for ClipboardRead {
     type Output = ClipboardSnapshot;
 }
 
+/// Asks the shell to download images (https only, each at most
+/// `clean::MAX_IMAGE_BYTES`) so the core can clean and inline them.
+#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct FetchImages {
+    pub urls: Vec<String>,
+}
+
+#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct FetchedImages {
+    /// One entry per requested URL, in order; `None` if it failed.
+    pub images: Vec<Option<Vec<u8>>>,
+}
+
+impl Operation for FetchImages {
+    type Output = FetchedImages;
+}
+
+/// Asks the shell to show a notification (if the user allowed them).
+#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Notify {
+    pub title: String,
+    pub body: String,
+}
+
+impl Operation for Notify {
+    type Output = ();
+}
+
 /// Asks the shell to put content on the system clipboard.
 #[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ClipboardWrite {
@@ -212,7 +284,9 @@ pub enum Effect {
     ClipboardAccess(ClipboardAccessCheck),
     NotificationPermission(NotificationPermissionRequest),
     ClipboardRead(ClipboardRead),
+    FetchImages(FetchImages),
     ClipboardWrite(ClipboardWrite),
+    Notify(Notify),
 }
 
 /// Largest text or single format kept for one item. Bigger formats (often
@@ -247,6 +321,11 @@ pub struct Model {
     history_items: Vec<ClipItem>,
     recent_items: Vec<ClipItem>,
     selected: Option<SelectedClip>,
+    /// Newest first; this session only.
+    failed: Vec<FailedCopy>,
+    next_failed_id: u64,
+    selected_failed: Option<u64>,
+    history_tab: HistoryTab,
     /// Timestamps of recent clipboard changes, for spotting a triple copy.
     recent_copies: Vec<u64>,
     copy_trigger: u32,
@@ -271,6 +350,10 @@ impl Default for Model {
             history_items: Vec::new(),
             recent_items: Vec::new(),
             selected: None,
+            failed: Vec::new(),
+            next_failed_id: 0,
+            selected_failed: None,
+            history_tab: HistoryTab::Saved,
             recent_copies: Vec::new(),
             copy_trigger: DEFAULT_COPY_TRIGGER,
             retention_amount: DEFAULT_RETENTION_DAYS,
@@ -333,6 +416,8 @@ pub struct SelectedClip {
     pub text: String,
     /// Every format it was copied in, so the viewer can show its styling.
     pub formats: Vec<ClipboardFormat>,
+    /// The sanitised HTML with cleaned images inlined, if it had HTML.
+    pub display_html: Option<String>,
 }
 
 #[derive(Facet, Serialize, Deserialize, Clone, Default)]
@@ -361,6 +446,10 @@ pub struct ViewModel {
     /// History items matching `history_search`, for the History window.
     pub history_items: Vec<ClipItem>,
     pub selected: Option<SelectedClip>,
+    pub history_tab: HistoryTab,
+    /// Copies rejected as malicious this session, newest first.
+    pub failed_items: Vec<ClipItem>,
+    pub selected_failed: Option<FailedCopy>,
     /// The newest items, unfiltered, for the tray menu.
     pub recent_items: Vec<ClipItem>,
     pub count: String,
@@ -447,22 +536,53 @@ impl App for Klippy {
                 model.recent_copies.clear();
                 return Command::request_from_shell(ClipboardRead).then_send(Event::Copied);
             }
-            Event::Copied(snapshot) => match snapshot.content {
-                Some(mut content)
-                    if !content.text.trim().is_empty() && content.text.len() <= MAX_ITEM_BYTES =>
-                {
-                    content
-                        .formats
-                        .retain(|format| format.data.len() <= MAX_ITEM_BYTES);
-                    logged(model.store.add(&content, snapshot.copied_at_ms));
-                    model.refresh();
-                }
-                _ => return Command::done(),
-            },
-            Event::CopyItem(id) => {
-                let Some(content) = logged(model.store.content(id)).flatten() else {
+            Event::Copied(snapshot) => {
+                let Some(content) = &snapshot.content else {
                     return Command::done();
                 };
+                if content.text.trim().is_empty() || content.text.len() > MAX_ITEM_BYTES {
+                    return Command::done();
+                }
+                // Reject crafted HTML straight away, before downloading anything.
+                let threats = html_of(content)
+                    .map(|html| clean::threats(&html))
+                    .unwrap_or_default();
+                if !threats.is_empty() {
+                    let text = content.text.clone();
+                    return reject_copy(model, text, threats, snapshot.copied_at_ms);
+                }
+                // Remote images are downloaded by the shell, then cleaned here.
+                let remote = html_of(content)
+                    .map(|html| clean::remote_sources(&clean::image_sources(&html)))
+                    .unwrap_or_default();
+                if !remote.is_empty() {
+                    return Command::request_from_shell(FetchImages { urls: remote })
+                        .then_send(move |images| Event::ImagesFetched { snapshot, images });
+                }
+                return save_copy(model, snapshot, &HashMap::new());
+            }
+            Event::ImagesFetched { snapshot, images } => {
+                let remote = snapshot
+                    .content
+                    .as_ref()
+                    .and_then(html_of)
+                    .map(|html| clean::remote_sources(&clean::image_sources(&html)))
+                    .unwrap_or_default();
+                let downloaded = remote
+                    .into_iter()
+                    .zip(images.images)
+                    .filter_map(|(url, image)| Some((url, image?)))
+                    .collect();
+                return save_copy(model, snapshot, &downloaded);
+            }
+            Event::CopyItem(id) => {
+                let Some(mut content) = logged(model.store.content(id)).flatten() else {
+                    return Command::done();
+                };
+                // Klippy's display copy stays out of the clipboard.
+                content
+                    .formats
+                    .retain(|format| format.kind != clean::DISPLAY_HTML_KIND);
                 // The item keeps its place in the list.
                 return Command::notify_shell(ClipboardWrite { content }).into();
             }
@@ -470,10 +590,18 @@ impl App for Klippy {
                 let Some(content) = logged(model.store.content(id)).flatten() else {
                     return Command::done();
                 };
+                let (display, formats): (Vec<_>, Vec<_>) = content
+                    .formats
+                    .into_iter()
+                    .partition(|format| format.kind == clean::DISPLAY_HTML_KIND);
                 model.selected = Some(SelectedClip {
                     id,
                     text: content.text,
-                    formats: content.formats,
+                    formats,
+                    display_html: display
+                        .into_iter()
+                        .next()
+                        .map(|format| String::from_utf8_lossy(&format.data).into_owned()),
                 });
             }
             Event::HistorySearch(search) => {
@@ -492,6 +620,40 @@ impl App for Klippy {
                         .store
                         .set_setting("copy_trigger", &model.copy_trigger.to_string()),
                 );
+            }
+            Event::ClearHistory => {
+                logged(model.store.clear());
+                model.selected = None;
+                model.refresh();
+            }
+            Event::SetHistoryTab(tab) => model.history_tab = tab,
+            Event::SelectFailed(id) => {
+                if !model.failed.iter().any(|failed| failed.id == id) {
+                    return Command::done();
+                }
+                model.selected_failed = Some(id);
+            }
+            Event::DismissFailed(id) => {
+                model.failed.retain(|failed| failed.id != id);
+                if model.selected_failed == Some(id) {
+                    model.selected_failed = None;
+                }
+            }
+            Event::DismissAllFailed => {
+                model.failed.clear();
+                model.selected_failed = None;
+            }
+            Event::CopyFailedText(id) => {
+                let Some(failed) = model.failed.iter().find(|failed| failed.id == id) else {
+                    return Command::done();
+                };
+                return Command::notify_shell(ClipboardWrite {
+                    content: ClipboardContent {
+                        text: failed.text.clone(),
+                        formats: vec![],
+                    },
+                })
+                .into();
             }
             Event::SetRetention { amount, unit } => {
                 model.retention_unit = unit;
@@ -538,10 +700,91 @@ impl App for Klippy {
             history_search: model.history_search.clone(),
             history_items: model.history_items.clone(),
             selected: model.selected.clone(),
+            history_tab: model.history_tab,
+            failed_items: model
+                .failed
+                .iter()
+                .map(|failed| ClipItem {
+                    id: failed.id,
+                    preview: failed.preview.clone(),
+                })
+                .collect(),
+            selected_failed: model
+                .selected_failed
+                .and_then(|id| model.failed.iter().find(|failed| failed.id == id))
+                .cloned(),
             recent_items: model.recent_items.clone(),
             count: format!("Count is: {}", model.count),
         }
     }
+}
+
+/// The copy's HTML, if it has any.
+fn html_of(content: &ClipboardContent) -> Option<String> {
+    content
+        .formats
+        .iter()
+        .find(|format| format.kind == "public.html")
+        .map(|format| String::from_utf8_lossy(&format.data).into_owned())
+}
+
+/// The preprocessing stage: drops oversized formats, adds the cleaned
+/// display copy of any HTML, then saves; or rejects the copy if its images
+/// turn out to be attacks.
+fn save_copy(
+    model: &mut Model,
+    snapshot: ClipboardSnapshot,
+    downloaded: &HashMap<String, Vec<u8>>,
+) -> Command<Effect, Event> {
+    let Some(mut content) = snapshot.content else {
+        return Command::done();
+    };
+    content.formats.retain(|format| {
+        format.data.len() <= MAX_ITEM_BYTES && format.kind != clean::DISPLAY_HTML_KIND
+    });
+    if let Some(html) = html_of(&content) {
+        let display = clean::display_html(&html, downloaded);
+        if !display.threats.is_empty() {
+            return reject_copy(model, content.text, display.threats, snapshot.copied_at_ms);
+        }
+        if display.html.len() <= MAX_ITEM_BYTES {
+            content.formats.push(ClipboardFormat {
+                kind: clean::DISPLAY_HTML_KIND.into(),
+                data: display.html.into_bytes(),
+            });
+        }
+    }
+    logged(model.store.add(&content, snapshot.copied_at_ms));
+    model.refresh();
+    render()
+}
+
+/// Keeps a malicious copy's plain text in the session's Failed list instead
+/// of saving it, and tells the user.
+fn reject_copy(
+    model: &mut Model,
+    text: String,
+    reasons: Vec<String>,
+    failed_at_ms: u64,
+) -> Command<Effect, Event> {
+    model.next_failed_id += 1;
+    model.failed.insert(
+        0,
+        FailedCopy {
+            id: model.next_failed_id,
+            preview: preview(&text),
+            text,
+            reasons,
+            failed_at_ms,
+        },
+    );
+    model.failed.truncate(MAX_FAILED);
+    let notify: Command<Effect, Event> = Command::notify_shell(Notify {
+        title: "Can't save copy".into(),
+        body: "Klippy found malicious content and didn't save it. See History → Failed.".into(),
+    })
+    .into();
+    render().and(notify)
 }
 
 /// Database errors are logged and the app carries on with what it has.
@@ -1096,8 +1339,188 @@ mod test {
                 id,
                 text: content.text,
                 formats: content.formats,
+                display_html: Some("<b>bold</b>".into()),
             })
         );
+    }
+
+    fn png() -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([0, 0, 255, 200]),
+        ))
+        .write_to(&mut out, image::ImageFormat::Png)
+        .unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn copies_with_remote_images_are_downloaded_cleaned_and_saved() {
+        let mut model = Model::default();
+        let html = r#"<p style="color: red; background-image: url(https://t.example/p)">Hi</p><img src="https://img.example/a.png">"#;
+        let original = ClipboardContent {
+            text: "Hi".into(),
+            formats: vec![ClipboardFormat {
+                kind: "public.html".into(),
+                data: html.as_bytes().to_vec(),
+            }],
+        };
+        let mut cmd = Klippy.update(
+            Event::Copied(ClipboardSnapshot {
+                content: Some(original.clone()),
+                copied_at_ms: 0,
+            }),
+            &mut model,
+        );
+        assert!(items(&model).is_empty(), "nothing saved before cleaning");
+
+        let mut request = cmd.expect_one_effect().expect_fetch_images();
+        assert_eq!(request.operation.urls, ["https://img.example/a.png"]);
+        request
+            .resolve(FetchedImages {
+                images: vec![Some(png())],
+            })
+            .unwrap();
+        let event = cmd.events().next().unwrap();
+        Klippy.update(event, &mut model).expect_only_render();
+
+        let id = Klippy.view(&model).items[0].id;
+        let _ = Klippy.update(Event::SelectItem(id), &mut model);
+        let selected = Klippy.view(&model).selected.unwrap();
+        let display = selected.display_html.unwrap();
+        assert!(display.contains("data:image/png;base64,"), "{display}");
+        for banned in ["img.example", "t.example"] {
+            assert!(!display.contains(banned), "{banned} survived: {display}");
+        }
+        assert_eq!(
+            selected.formats, original.formats,
+            "originals kept for pasting"
+        );
+
+        let mut cmd = Klippy.update(Event::CopyItem(id), &mut model);
+        let write = cmd.expect_one_effect().expect_clipboard_write();
+        assert_eq!(
+            write.operation.content, original,
+            "display copy never pasted"
+        );
+    }
+
+    fn html_copy(html: &str) -> Event {
+        Event::Copied(ClipboardSnapshot {
+            content: Some(ClipboardContent {
+                text: "plain words".into(),
+                formats: vec![ClipboardFormat {
+                    kind: "public.html".into(),
+                    data: html.as_bytes().to_vec(),
+                }],
+            }),
+            copied_at_ms: 7,
+        })
+    }
+
+    #[test]
+    fn malicious_copies_are_not_saved_but_listed_and_notified() {
+        let mut model = Model::default();
+        let mut cmd = Klippy.update(
+            html_copy(r#"<p onclick="steal()">hi</p><script>bad()</script>"#),
+            &mut model,
+        );
+        let effects: Vec<Effect> = cmd.effects().collect();
+        assert!(effects.iter().any(Effect::is_render));
+        let notify = effects
+            .into_iter()
+            .find(Effect::is_notify)
+            .unwrap()
+            .expect_notify();
+        assert_eq!(notify.operation.title, "Can't save copy");
+
+        assert!(items(&model).is_empty(), "not saved");
+        let view = Klippy.view(&model);
+        assert_eq!(view.failed_items.len(), 1);
+        let id = view.failed_items[0].id;
+        let _ = Klippy.update(Event::SelectFailed(id), &mut model);
+        let failed = Klippy.view(&model).selected_failed.unwrap();
+        assert_eq!(failed.text, "plain words");
+        assert_eq!(failed.failed_at_ms, 7);
+        assert_eq!(
+            failed.reasons,
+            ["Runs code on an event (onclick)", "Contains a script"]
+        );
+    }
+
+    #[test]
+    fn malicious_images_reject_the_copy_after_download() {
+        let mut model = Model::default();
+        let mut cmd = Klippy.update(
+            html_copy(r#"<p>hi</p><img src="https://img.example/a.svg">"#),
+            &mut model,
+        );
+        let mut request = cmd.expect_one_effect().expect_fetch_images();
+        request
+            .resolve(FetchedImages {
+                images: vec![Some(b"<svg><script>alert(1)</script></svg>".to_vec())],
+            })
+            .unwrap();
+        let event = cmd.events().next().unwrap();
+        let mut cmd = Klippy.update(event, &mut model);
+        assert!(cmd.effects().any(|effect| effect.is_notify()));
+        assert!(items(&model).is_empty());
+        assert_eq!(Klippy.view(&model).failed_items.len(), 1);
+    }
+
+    #[test]
+    fn failed_copies_can_be_copied_as_text_or_dismissed() {
+        let mut model = Model::default();
+        for _ in 0..2 {
+            let _ = Klippy.update(html_copy("<script>x</script>"), &mut model);
+        }
+        let ids: Vec<u64> = Klippy
+            .view(&model)
+            .failed_items
+            .iter()
+            .map(|item| item.id)
+            .collect();
+
+        let mut cmd = Klippy.update(Event::CopyFailedText(ids[0]), &mut model);
+        let write = cmd.expect_one_effect().expect_clipboard_write();
+        assert_eq!(
+            write.operation.content,
+            ClipboardContent {
+                text: "plain words".into(),
+                formats: vec![]
+            },
+            "text only, never the HTML"
+        );
+
+        let _ = Klippy.update(Event::SelectFailed(ids[0]), &mut model);
+        let _ = Klippy.update(Event::DismissFailed(ids[0]), &mut model);
+        let view = Klippy.view(&model);
+        assert_eq!(view.failed_items.len(), 1);
+        assert_eq!(view.selected_failed, None);
+
+        let _ = Klippy.update(Event::DismissAllFailed, &mut model);
+        assert!(Klippy.view(&model).failed_items.is_empty());
+    }
+
+    #[test]
+    fn clear_history_deletes_everything_saved() {
+        let mut model = Model::default();
+        for text in ["a", "b"] {
+            let _ = Klippy.update(copied(text), &mut model);
+        }
+        let id = Klippy.view(&model).items[0].id;
+        let _ = Klippy.update(Event::SelectItem(id), &mut model);
+
+        Klippy
+            .update(Event::ClearHistory, &mut model)
+            .expect_only_render();
+        let view = Klippy.view(&model);
+        assert!(
+            view.items.is_empty() && view.history_items.is_empty() && view.recent_items.is_empty()
+        );
+        assert_eq!(view.selected, None);
     }
 
     #[test]

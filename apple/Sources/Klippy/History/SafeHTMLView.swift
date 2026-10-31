@@ -26,7 +26,7 @@ struct SafeHTMLView: NSViewRepresentable {
     func updateNSView(_ webView: WKWebView, context: Context) {
         guard context.coordinator.shownHTML != html else { return }
         context.coordinator.shownHTML = html
-        let page = Self.contentSecurityPolicy + html
+        let page = Self.contentSecurityPolicy + Self.pageStyle + html
         Task { @MainActor in
             // Rules must be in place before loading, or images would load first.
             guard let rules = await Self.blockEverything() else { return }
@@ -58,6 +58,11 @@ struct SafeHTMLView: NSViewRepresentable {
     private static let contentSecurityPolicy = """
     <meta http-equiv="Content-Security-Policy" \
     content="default-src 'none'; style-src 'unsafe-inline'; img-src data:">
+    """
+
+    /// Breathing room around the content, and images that fit the window.
+    private static let pageStyle = """
+    <style>body { margin: 24px 28px; } img { max-width: 100%; height: auto; }</style>
     """
 
     private static let ruleList = """

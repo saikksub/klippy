@@ -1,6 +1,7 @@
 #![allow(clippy::unsafe_derive_deserialize)]
 
 mod app;
+mod clean;
 pub mod ffi;
 mod store;
 

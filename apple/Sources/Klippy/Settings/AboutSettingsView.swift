@@ -26,6 +26,19 @@ struct AboutSettingsView: View {
                     Link("xplorebits.com", destination: URL(string: "https://xplorebits.com")!)
                 }
             }
+            // Required by the icon's CC BY 4.0 licence.
+            Section("Logo") {
+                LabeledContent("Icon", value: "solar:paperclip-rounded-2-linear")
+                LabeledContent("From") {
+                    Link(
+                        "Solar Icons Set by 480 Design",
+                        destination: URL(string: "https://www.figma.com/community/file/1166831539721848736/solar-icons-set")!
+                    )
+                }
+                LabeledContent("Licence") {
+                    Link("CC BY 4.0", destination: URL(string: "https://creativecommons.org/licenses/by/4.0/")!)
+                }
+            }
         }
         .formStyle(.grouped)
     }

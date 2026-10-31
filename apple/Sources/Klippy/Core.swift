@@ -147,6 +147,15 @@ final class Core: ObservableObject {
             let snapshot = ClipboardSnapshot(content: Self.readClipboard(), copiedAtMs: Self.nowMs)
             // swiftlint:disable:next force_try
             processEffects(core.resolve(id: request.id, data: Data(try! snapshot.bincodeSerialize())))
+        case let .fetchImages(fetch):
+            let id = request.id
+            Task {
+                let fetched = FetchedImages(images: await ImageFetcher.fetch(fetch.urls))
+                // swiftlint:disable:next force_try
+                processEffects(core.resolve(id: id, data: Data(try! fetched.bincodeSerialize())))
+            }
+        case let .notify(note):
+            Self.postNotification(title: note.title, body: note.body)
         case let .clipboardWrite(write):
             let item = NSPasteboardItem()
             item.setString(write.content.text, forType: .string)
@@ -158,6 +167,18 @@ final class Core: ObservableObject {
             // Our own write isn't a user copy, so don't count it.
             lastChangeCount = NSPasteboard.general.changeCount
         }
+    }
+
+    /// Shown only if the user allowed notifications; macOS drops it otherwise.
+    private static func postNotification(title: String, body: String) {
+        guard Bundle.main.bundleURL.pathExtension == "app" else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        )
     }
 
     /// Shows the system's Allow / Don't Allow prompt the first time; after that

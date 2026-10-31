@@ -25,9 +25,18 @@ struct TrayMenu: View {
                 }
                 Divider()
                 Button("Show All History…") { show(HistoryView.windowID) }
+                if !core.view.failedItems.isEmpty {
+                    Button("Failed to Save (\(core.view.failedItems.count))…") {
+                        core.update(.setHistoryTab(.failed))
+                        show(HistoryView.windowID)
+                    }
+                }
+                Divider()
+                Button("Clear History…") { show(ClearHistoryView.windowID) }
             }
         }
         Divider()
+        Button("About Klippy", action: AboutPanel.show)
         SettingsLink {
             Text("Settings…")
         }

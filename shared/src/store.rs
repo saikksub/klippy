@@ -50,7 +50,8 @@ impl Store {
     fn new(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA foreign_keys = ON;",
+             PRAGMA foreign_keys = ON;
+             PRAGMA secure_delete = ON;",
         )?;
         let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version < SCHEMA_VERSION {
@@ -215,6 +216,14 @@ impl Store {
             "DELETE FROM clips WHERE copied_at < ?1",
             [to_sql_ms(cutoff_ms)],
         )
+    }
+
+    /// Deletes every item (settings stay) and compacts the file, so nothing
+    /// deleted lingers on disk.
+    pub fn clear(&self) -> rusqlite::Result<()> {
+        let conn = self.conn();
+        conn.execute("DELETE FROM clips", [])?;
+        conn.execute_batch("VACUUM;")
     }
 
     pub fn setting(&self, key: &str) -> rusqlite::Result<Option<String>> {
@@ -397,6 +406,21 @@ mod test {
             )
             .unwrap();
         assert_eq!(orphans, 0);
+    }
+
+    #[test]
+    fn clear_deletes_items_and_their_formats_but_keeps_settings() {
+        let store = Store::in_memory();
+        store.add(&content("a"), 1).unwrap();
+        store.set_setting("copy_trigger", "2").unwrap();
+        store.clear().unwrap();
+        assert!(store.list("").unwrap().is_empty());
+        let formats: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM formats", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(formats, 0);
+        assert_eq!(store.setting("copy_trigger").unwrap().as_deref(), Some("2"));
     }
 
     #[test]

@@ -50,3 +50,4 @@ struct CoreTests {
         #expect(core.view.copyTrigger == 4)
     }
 }
+

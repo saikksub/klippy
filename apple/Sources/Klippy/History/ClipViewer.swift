@@ -3,13 +3,16 @@ import AppKit
 import SwiftUI
 
 /// Shows a copied item as it was copied, without letting it run anything:
-/// RTF/RTFD with attachments and links stripped, HTML in a locked-down web
-/// view, otherwise plain text.
+/// the HTML the Rust core sanitised (images cleaned and inlined at copy time),
+/// RTF/RTFD with attachments and links stripped, otherwise plain text. All
+/// HTML still goes through the locked-down web view.
 struct ClipViewer: View {
     let clip: SelectedClip
 
     var body: some View {
-        if let rich = Self.richText(clip) {
+        if let display = clip.displayHtml {
+            SafeHTMLView(html: display)
+        } else if let rich = Self.richText(clip) {
             SafeTextView(text: rich, id: clip.id, isRich: true)
         } else if let html = Self.format(.html, of: clip) {
             SafeHTMLView(html: String(decoding: html, as: UTF8.self))
@@ -66,7 +69,7 @@ private struct SafeTextView: NSViewRepresentable {
         textView.isSelectable = true
         textView.importsGraphics = false
         textView.isAutomaticLinkDetectionEnabled = false
-        textView.textContainerInset = NSSize(width: 16, height: 16)
+        textView.textContainerInset = NSSize(width: 28, height: 24)
         return scrollView
     }
 
