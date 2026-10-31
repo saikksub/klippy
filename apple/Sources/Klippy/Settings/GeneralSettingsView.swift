@@ -95,6 +95,21 @@ struct GeneralSettingsView: View {
             .disabled(!core.view.unlocked)
 
             Section {
+                Picker("Clicking a menu bar history item", selection: Binding(
+                    get: { core.view.trayClickAction },
+                    set: { core.update(.setTrayClickAction($0)) }
+                )) {
+                    Text("Opens it").tag(TrayClickAction.view)
+                    Text("Copies it to the clipboard").tag(TrayClickAction.copy)
+                }
+            } footer: {
+                Text("What happens when you pick an item in the menu bar's History menu.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .disabled(!core.view.unlocked)
+
+            Section {
                 LabeledContent("Saved copies") {
                     Button("Clear History…", role: .destructive) {
                         openWindow(id: ClearHistoryView.windowID)

@@ -11,7 +11,7 @@ use std::{path::Path, sync::Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::{ClipItem, ClipboardContent, ClipboardFormat};
+use crate::{Appearance, ClipItem, ClipboardContent, ClipboardFormat, appearance};
 
 /// A ceiling on top of the age-based clean-up, so a very long retention can't
 /// grow the database without bound.
@@ -20,7 +20,8 @@ pub const MAX_ITEMS: usize = 1000;
 /// Longest preview stored for the list; the full text stays in `text`.
 const PREVIEW_CHARS: usize = 300;
 
-const SCHEMA_VERSION: i32 = 1;
+/// 2 added `clips.appearance`.
+const SCHEMA_VERSION: i32 = 2;
 
 /// SQLCipher's raw key size: 256 bits.
 pub const KEY_BYTES: usize = 32;
@@ -47,15 +48,15 @@ impl Store {
             .expect("in-memory schema")
     }
 
-    fn new(conn: Connection) -> rusqlite::Result<Self> {
+    fn new(mut conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;
              PRAGMA secure_delete = ON;",
         )?;
         let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version < SCHEMA_VERSION {
-            conn.execute_batch(&format!(
+        if version < 1 {
+            conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS clips (
                      id          INTEGER PRIMARY KEY AUTOINCREMENT, -- never reused
                      seq         INTEGER NOT NULL,  -- list order, higher = newer
@@ -78,8 +79,29 @@ impl Store {
                      key   TEXT PRIMARY KEY,
                      value TEXT NOT NULL
                  );
-                 PRAGMA user_version = {SCHEMA_VERSION};"
-            ))?;
+                 PRAGMA user_version = 1;",
+            )?;
+        }
+        if version < 2 {
+            // Items saved before then are decided now, from what was stored.
+            let tx = conn.transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE clips ADD COLUMN appearance TEXT NOT NULL DEFAULT 'system';",
+            )?;
+            let ids = tx
+                .prepare("SELECT id FROM clips")?
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for id in ids {
+                if let Some(content) = content_in(&tx, id)? {
+                    tx.execute(
+                        "UPDATE clips SET appearance = ?1 WHERE id = ?2",
+                        params![appearance::detect(&content).name(), id],
+                    )?;
+                }
+            }
+            tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+            tx.commit()?;
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -94,11 +116,13 @@ impl Store {
     }
 
     /// Adds to the top of the history. Text already there moves to the top
-    /// and takes the new formats.
+    /// and takes the new formats. Whether it's light or dark is decided here,
+    /// once, from those formats.
     pub fn add(&self, content: &ClipboardContent, now_ms: u64) -> rusqlite::Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let hash = text_hash(&content.text);
+        let appearance = appearance::detect(content).name();
         let seq: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM clips", [], |row| {
             row.get(0)
         })?;
@@ -111,22 +135,24 @@ impl Store {
             .optional()?;
         let id = if let Some(id) = existing {
             tx.execute(
-                "UPDATE clips SET seq = ?1, copied_at = ?2 WHERE id = ?3",
-                params![seq, to_sql_ms(now_ms), id],
+                "UPDATE clips SET seq = ?1, copied_at = ?2, appearance = ?3 WHERE id = ?4",
+                params![seq, to_sql_ms(now_ms), appearance, id],
             )?;
             tx.execute("DELETE FROM formats WHERE clip_id = ?1", [id])?;
             id
         } else {
             tx.execute(
-                "INSERT INTO clips (seq, copied_at, text, search_text, preview, text_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO clips
+                     (seq, copied_at, text, search_text, preview, text_hash, appearance)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     seq,
                     to_sql_ms(now_ms),
                     content.text,
                     content.text.to_lowercase(),
                     preview(&content.text),
-                    hash
+                    hash,
+                    appearance
                 ],
             )?;
             tx.last_insert_rowid()
@@ -178,28 +204,20 @@ impl Store {
 
     /// The full text and formats of one item.
     pub fn content(&self, id: u64) -> rusqlite::Result<Option<ClipboardContent>> {
-        let conn = self.conn();
-        let Some(text) = conn
+        content_in(&self.conn(), to_sql_id(id))
+    }
+
+    /// Whether the item was made for a light or a dark page.
+    pub fn appearance(&self, id: u64) -> rusqlite::Result<Option<Appearance>> {
+        let name = self
+            .conn()
             .query_row(
-                "SELECT text FROM clips WHERE id = ?1",
+                "SELECT appearance FROM clips WHERE id = ?1",
                 [to_sql_id(id)],
                 |row| row.get::<_, String>(0),
             )
-            .optional()?
-        else {
-            return Ok(None);
-        };
-        let mut query = conn
-            .prepare_cached("SELECT kind, data FROM formats WHERE clip_id = ?1 ORDER BY rowid")?;
-        let formats = query
-            .query_map([to_sql_id(id)], |row| {
-                Ok(ClipboardFormat {
-                    kind: row.get(0)?,
-                    data: row.get(1)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(Some(ClipboardContent { text, formats }))
+            .optional()?;
+        Ok(name.map(|name| Appearance::from_name(&name).unwrap_or_default()))
     }
 
     pub fn contains(&self, id: u64) -> rusqlite::Result<bool> {
@@ -242,6 +260,28 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+fn content_in(conn: &Connection, id: i64) -> rusqlite::Result<Option<ClipboardContent>> {
+    let Some(text) = conn
+        .query_row("SELECT text FROM clips WHERE id = ?1", [id], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let mut query =
+        conn.prepare_cached("SELECT kind, data FROM formats WHERE clip_id = ?1 ORDER BY rowid")?;
+    let formats = query
+        .query_map([id], |row| {
+            Ok(ClipboardFormat {
+                kind: row.get(0)?,
+                data: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Some(ClipboardContent { text, formats }))
 }
 
 /// Collapses all whitespace (including newlines) so the text fits one line,
@@ -421,6 +461,48 @@ mod test {
             .unwrap();
         assert_eq!(formats, 0);
         assert_eq!(store.setting("copy_trigger").unwrap().as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn decides_the_appearance_when_saving() {
+        let store = Store::in_memory();
+        let dark = ClipboardContent {
+            text: "dark".into(),
+            formats: vec![ClipboardFormat {
+                kind: "public.html".into(),
+                data: br#"<div style="background-color:#1e1e1e;color:#ddd">dark</div>"#.to_vec(),
+            }],
+        };
+        store.add(&dark, 1).unwrap();
+        store.add(&content("plain"), 2).unwrap();
+        let ids: Vec<u64> = store.list("").unwrap().iter().map(|item| item.id).collect();
+        assert_eq!(store.appearance(ids[0]).unwrap(), Some(Appearance::System));
+        assert_eq!(store.appearance(ids[1]).unwrap(), Some(Appearance::Dark));
+        assert_eq!(store.appearance(999).unwrap(), None);
+    }
+
+    #[test]
+    fn upgrading_from_version_1_decides_existing_items() {
+        let path = temp_path("upgrade");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE clips (id INTEGER PRIMARY KEY AUTOINCREMENT, seq INTEGER NOT NULL,
+                     copied_at INTEGER NOT NULL, text TEXT NOT NULL, search_text TEXT NOT NULL,
+                     preview TEXT NOT NULL, text_hash INTEGER NOT NULL);
+                 CREATE TABLE formats (clip_id INTEGER NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+                     kind TEXT NOT NULL, data BLOB NOT NULL);
+                 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO clips VALUES (1, 1, 1, 'x', 'x', 'x', 0);
+                 INSERT INTO formats VALUES (1, 'public.html', CAST('<p style=color:#eee>x</p>' AS BLOB));
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let store = Store::new(Connection::open(&path).unwrap()).unwrap();
+        assert_eq!(store.appearance(1).unwrap(), Some(Appearance::Dark));
+        drop(store);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

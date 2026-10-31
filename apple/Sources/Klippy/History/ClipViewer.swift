@@ -5,17 +5,18 @@ import SwiftUI
 /// Shows a copied item as it was copied, without letting it run anything:
 /// the HTML the Rust core sanitised (images cleaned and inlined at copy time),
 /// RTF/RTFD with attachments and links stripped, otherwise plain text. All
-/// HTML still goes through the locked-down web view.
+/// HTML still goes through the locked-down web view. Each is shown light or
+/// dark as decided when it was saved, whatever the system's mode.
 struct ClipViewer: View {
     let clip: SelectedClip
 
     var body: some View {
         if let display = clip.displayHtml {
-            SafeHTMLView(html: display)
+            SafeHTMLView(html: display, appearance: clip.appearance)
         } else if let rich = Self.richText(clip) {
-            SafeTextView(text: rich, id: clip.id, isRich: true)
+            SafeTextView(text: rich, id: clip.id, appearance: clip.appearance)
         } else if let html = Self.format(.html, of: clip) {
-            SafeHTMLView(html: String(decoding: html, as: UTF8.self))
+            SafeHTMLView(html: String(decoding: html, as: UTF8.self), appearance: clip.appearance)
         } else {
             SafeTextView(
                 text: NSAttributedString(string: clip.text, attributes: [
@@ -23,7 +24,7 @@ struct ClipViewer: View {
                     .foregroundColor: NSColor.labelColor,
                 ]),
                 id: clip.id,
-                isRich: false
+                appearance: clip.appearance
             )
         }
     }
@@ -52,6 +53,12 @@ struct ClipViewer: View {
         for range in attachments.reversed() {
             clean.replaceCharacters(in: range, with: "[attachment removed]")
         }
+        // Text without a colour of its own takes the page's, so it stays
+        // readable on a dark page too.
+        let all = NSRange(location: 0, length: clean.length)
+        clean.enumerateAttribute(.foregroundColor, in: all) { value, range, _ in
+            if value == nil { clean.addAttribute(.foregroundColor, value: NSColor.textColor, range: range) }
+        }
         return clean
     }
 }
@@ -60,7 +67,7 @@ struct ClipViewer: View {
 private struct SafeTextView: NSViewRepresentable {
     let text: NSAttributedString
     let id: UInt64
-    let isRich: Bool
+    let appearance: Appearance
 
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSTextView.scrollableTextView()
@@ -77,9 +84,9 @@ private struct SafeTextView: NSViewRepresentable {
         guard context.coordinator.shownID != id else { return }
         context.coordinator.shownID = id
         let textView = scrollView.documentView as! NSTextView
-        // Rich text carries its own (usually dark) colours, so show it on a
-        // light page as it looked where it was copied from.
-        textView.backgroundColor = isRich ? .white : .textBackgroundColor
+        // The page colours are dynamic, so they follow the forced appearance.
+        scrollView.appearance = appearance.nsAppearance
+        textView.backgroundColor = .textBackgroundColor
         textView.textStorage?.setAttributedString(text)
         textView.scrollToBeginningOfDocument(nil)
     }
@@ -88,5 +95,25 @@ private struct SafeTextView: NSViewRepresentable {
 
     final class Coordinator {
         var shownID: UInt64?
+    }
+}
+
+extension Appearance {
+    /// `nil` follows the system.
+    var nsAppearance: NSAppearance? {
+        switch self {
+        case .system: nil
+        case .light: NSAppearance(named: .aqua)
+        case .dark: NSAppearance(named: .darkAqua)
+        }
+    }
+
+    /// The CSS `color-scheme` that gives a page matching default colours.
+    var colorScheme: String {
+        switch self {
+        case .system: "light dark"
+        case .light: "light"
+        case .dark: "dark"
+        }
     }
 }

@@ -1,3 +1,4 @@
+import App
 import SwiftUI
 import WebKit
 
@@ -11,6 +12,8 @@ import WebKit
 /// WebKit also renders in a separate, OS-sandboxed process.
 struct SafeHTMLView: NSViewRepresentable {
     let html: String
+    /// Light or dark page, as decided when the copy was saved.
+    let appearance: Appearance
 
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
@@ -24,9 +27,12 @@ struct SafeHTMLView: NSViewRepresentable {
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
-        guard context.coordinator.shownHTML != html else { return }
+        guard context.coordinator.shownHTML != html || context.coordinator.shownAppearance != appearance
+        else { return }
         context.coordinator.shownHTML = html
-        let page = Self.contentSecurityPolicy + Self.pageStyle + html
+        context.coordinator.shownAppearance = appearance
+        webView.appearance = appearance.nsAppearance
+        let page = Self.contentSecurityPolicy + Self.pageStyle(appearance) + html
         Task { @MainActor in
             // Rules must be in place before loading, or images would load first.
             guard let rules = await Self.blockEverything() else { return }
@@ -40,6 +46,7 @@ struct SafeHTMLView: NSViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate {
         var shownHTML: String?
+        var shownAppearance: Appearance?
 
         /// Only the page itself, loaded as about:blank, is allowed.
         func webView(
@@ -60,10 +67,14 @@ struct SafeHTMLView: NSViewRepresentable {
     content="default-src 'none'; style-src 'unsafe-inline'; img-src data:">
     """
 
-    /// Breathing room around the content, and images that fit the window.
-    private static let pageStyle = """
-    <style>body { margin: 24px 28px; } img { max-width: 100%; height: auto; }</style>
-    """
+    /// Breathing room around the content, images that fit the window, and
+    /// default page and text colours for the copy's appearance.
+    private static func pageStyle(_ appearance: Appearance) -> String {
+        """
+        <style>:root { color-scheme: \(appearance.colorScheme); } \
+        body { margin: 24px 28px; } img { max-width: 100%; height: auto; }</style>
+        """
+    }
 
     private static let ruleList = """
     [{"trigger": {"url-filter": ".*", "resource-type": ["image", "style-sheet", "script", "font", \

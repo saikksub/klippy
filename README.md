@@ -174,3 +174,7 @@ in `Core.processEffect` in `apple/Sources/Klippy/Core.swift`.
   builds `libshared.a` with cargo and generates bindings with `boltffi generate swift` instead.
 - The build is for the host architecture (Apple silicon). For a universal binary, build
   `x86_64-apple-darwin` too and combine the libraries with `lipo`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

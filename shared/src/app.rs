@@ -75,6 +75,8 @@ pub enum Event {
         quick: bool,
     },
     SetQuickExportFormat(ExportFormat),
+    /// What clicking an item in the tray menu's History does.
+    SetTrayClickAction(TrayClickAction),
     /// Delete items not copied again within this long (1 minute to 365 days).
     SetRetention {
         amount: u32,
@@ -124,6 +126,59 @@ impl ExportFormat {
         [Self::Pdf, Self::Html, Self::Markdown]
             .into_iter()
             .find(|format| format.extension() == name)
+    }
+}
+
+/// The kind of page a copy was made for, decided when it's saved so the
+/// viewer shows it on a matching background.
+#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub enum Appearance {
+    /// No colours of its own: follows the system's light or dark mode.
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        [Self::System, Self::Light, Self::Dark]
+            .into_iter()
+            .find(|appearance| appearance.name() == name)
+    }
+}
+
+#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub enum TrayClickAction {
+    /// Open the item in the History window.
+    #[default]
+    View,
+    /// Put it back on the clipboard.
+    Copy,
+}
+
+impl TrayClickAction {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::View => "view",
+            Self::Copy => "copy",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        [Self::View, Self::Copy]
+            .into_iter()
+            .find(|action| action.name() == name)
     }
 }
 
@@ -395,6 +450,7 @@ pub struct Model {
     retention_amount: u32,
     retention_unit: RetentionUnit,
     quick_export_format: ExportFormat,
+    tray_click_action: TrayClickAction,
     search: String,
     history_search: String,
     count: isize,
@@ -423,6 +479,7 @@ impl Default for Model {
             retention_amount: DEFAULT_RETENTION_DAYS,
             retention_unit: RetentionUnit::Days,
             quick_export_format: ExportFormat::Pdf,
+            tray_click_action: TrayClickAction::View,
             search: String::new(),
             history_search: String::new(),
             count: 0,
@@ -457,6 +514,11 @@ impl Model {
         {
             self.quick_export_format = format;
         }
+        if let Some(action) =
+            setting("tray_click_action").and_then(|v| TrayClickAction::from_name(&v))
+        {
+            self.tray_click_action = action;
+        }
         if let (Some(amount), Some(unit)) = (
             setting("retention_amount").and_then(|v| v.parse().ok()),
             setting("retention_unit").and_then(|v| RetentionUnit::from_name(&v)),
@@ -488,6 +550,8 @@ pub struct SelectedClip {
     pub formats: Vec<ClipboardFormat>,
     /// The sanitised HTML with cleaned images inlined, if it had HTML.
     pub display_html: Option<String>,
+    /// Light or dark, as decided when it was saved.
+    pub appearance: Appearance,
 }
 
 #[derive(Facet, Serialize, Deserialize, Clone, Default)]
@@ -512,6 +576,7 @@ pub struct ViewModel {
     pub retention_hint: String,
     /// What the Home list's export button saves as.
     pub quick_export_format: ExportFormat,
+    pub tray_click_action: TrayClickAction,
     /// History items matching `search`, newest first.
     pub items: Vec<ClipItem>,
     pub history_search: String,
@@ -674,6 +739,9 @@ impl App for Klippy {
                         .into_iter()
                         .next()
                         .map(|format| String::from_utf8_lossy(&format.data).into_owned()),
+                    appearance: logged(model.store.appearance(id))
+                        .flatten()
+                        .unwrap_or_default(),
                 });
             }
             Event::HistorySearch(search) => {
@@ -760,6 +828,10 @@ impl App for Klippy {
                         .set_setting("quick_export_format", format.extension()),
                 );
             }
+            Event::SetTrayClickAction(action) => {
+                model.tray_click_action = action;
+                logged(model.store.set_setting("tray_click_action", action.name()));
+            }
             Event::SetRetention { amount, unit } => {
                 model.retention_unit = unit;
                 model.retention_amount = clamp_retention(amount, unit);
@@ -802,6 +874,7 @@ impl App for Klippy {
             retention_max_amount: model.retention_unit.max_amount(),
             retention_hint: retention_hint(model.retention_amount, model.retention_unit),
             quick_export_format: model.quick_export_format,
+            tray_click_action: model.tray_click_action,
             items: model.items.clone(),
             history_search: model.history_search.clone(),
             history_items: model.history_items.clone(),
@@ -1474,6 +1547,7 @@ mod test {
                 text: content.text,
                 formats: content.formats,
                 display_html: Some("<b>bold</b>".into()),
+                appearance: Appearance::System,
             })
         );
     }
@@ -1661,6 +1735,44 @@ mod test {
         assert_eq!(save.file_name, "Klippy – plain words.md");
         let markdown = String::from_utf8(save.data.clone()).unwrap();
         assert!(markdown.contains("# Report"), "{markdown}");
+    }
+
+    #[test]
+    fn tray_clicks_open_items_by_default_and_the_choice_is_saved() {
+        let mut model = Model::default();
+        assert_eq!(Klippy.view(&model).tray_click_action, TrayClickAction::View);
+        let _ = Klippy.update(Event::SetTrayClickAction(TrayClickAction::Copy), &mut model);
+        assert_eq!(Klippy.view(&model).tray_click_action, TrayClickAction::Copy);
+
+        let mut reloaded = Model {
+            store: std::mem::replace(&mut model.store, Store::in_memory()),
+            ..Model::default()
+        };
+        reloaded.load_settings();
+        assert_eq!(reloaded.tray_click_action, TrayClickAction::Copy);
+    }
+
+    #[test]
+    fn the_viewer_gets_the_appearance_decided_when_saving() {
+        let mut model = Model::default();
+        let _ = Klippy.update(
+            Event::Copied(ClipboardSnapshot {
+                content: Some(ClipboardContent {
+                    text: "dark".into(),
+                    formats: vec![ClipboardFormat {
+                        kind: "public.html".into(),
+                        data: br#"<pre style="background-color:#1e1e1e;color:#d4d4d4">dark</pre>"#
+                            .to_vec(),
+                    }],
+                }),
+                copied_at_ms: 1,
+            }),
+            &mut model,
+        );
+        let id = Klippy.view(&model).items[0].id;
+        let _ = Klippy.update(Event::SelectItem(id), &mut model);
+        let selected = Klippy.view(&model).selected.unwrap();
+        assert_eq!(selected.appearance, Appearance::Dark);
     }
 
     #[test]

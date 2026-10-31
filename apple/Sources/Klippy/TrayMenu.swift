@@ -21,7 +21,7 @@ struct TrayMenu: View {
                 // The newest items only: menus build every row up front, so
                 // the full history lives in the History window.
                 ForEach(core.view.recentItems, id: \.id) { item in
-                    Button(Self.title(item.preview)) { core.update(.copyItem(item.id)) }
+                    Button(Self.title(item.preview)) { open(item) }
                 }
                 Divider()
                 Button("Show All History…") { show(HistoryView.windowID) }
@@ -44,6 +44,18 @@ struct TrayMenu: View {
         Divider()
         Button("Quit Klippy") { NSApp.terminate(nil) }
             .keyboardShortcut("q")
+    }
+
+    /// Views or copies the item, as chosen in Settings.
+    private func open(_ item: ClipItem) {
+        switch core.view.trayClickAction {
+        case .view:
+            core.update(.setHistoryTab(.saved))
+            core.update(.selectItem(item.id))
+            show(HistoryView.windowID)
+        case .copy:
+            core.update(.copyItem(item.id))
+        }
     }
 
     private func show(_ windowID: String) {
