@@ -79,6 +79,22 @@ struct GeneralSettingsView: View {
             .disabled(!core.view.unlocked)
 
             Section {
+                Picker("Quick export format", selection: Binding(
+                    get: { core.view.quickExportFormat },
+                    set: { core.update(.setQuickExportFormat($0)) }
+                )) {
+                    ForEach(ExportFormat.all, id: \.self) { format in
+                        Text(format.label).tag(format)
+                    }
+                }
+            } footer: {
+                Text("What the export button in the main window's list saves to Downloads.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .disabled(!core.view.unlocked)
+
+            Section {
                 LabeledContent("Saved copies") {
                     Button("Clear History…", role: .destructive) {
                         openWindow(id: ClearHistoryView.windowID)

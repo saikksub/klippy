@@ -67,7 +67,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         NSApp.activate(ignoringOtherApps: true)
         LaunchAtLogin.enableOnFirstLaunch()
         if Bundle.main.bundleURL.pathExtension == "app" {
-            UNUserNotificationCenter.current().delegate = self
+            let center = UNUserNotificationCenter.current()
+            center.delegate = self
+            center.setNotificationCategories([
+                UNNotificationCategory(
+                    identifier: Core.revealCategory,
+                    actions: [UNNotificationAction(identifier: Core.revealAction, title: "Show in Finder")],
+                    intentIdentifiers: []
+                ),
+            ])
         }
     }
 
@@ -85,6 +93,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         alert.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
         return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
+    }
+
+    /// Clicking an "Exported" notification (or its Show in Finder button)
+    /// opens the folder with the file selected.
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        guard [UNNotificationDefaultActionIdentifier, Core.revealAction].contains(response.actionIdentifier),
+              let path = response.notification.request.content.userInfo[Core.revealPathKey] as? String
+        else { return }
+        await MainActor.run {
+            let file = URL(fileURLWithPath: path)
+            if FileManager.default.fileExists(atPath: path) {
+                NSWorkspace.shared.activateFileViewerSelecting([file])
+            } else {
+                // Moved or deleted since: open the folder it was saved in.
+                NSWorkspace.shared.open(file.deletingLastPathComponent())
+            }
+        }
     }
 
     /// Show Klippy's notifications even while it's the frontmost app.

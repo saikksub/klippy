@@ -73,7 +73,8 @@ struct SafeHTMLView: NSViewRepresentable {
 
     @MainActor private static var compiled: WKContentRuleList?
 
-    @MainActor private static func blockEverything() async -> WKContentRuleList? {
+    /// Also used by the PDF exporter.
+    @MainActor static func blockEverything() async -> WKContentRuleList? {
         if let compiled { return compiled }
         compiled = try? await WKContentRuleListStore.default()
             .compileContentRuleList(forIdentifier: "klippy-block-everything", encodedContentRuleList: ruleList)

@@ -154,8 +154,15 @@ final class Core: ObservableObject {
                 // swiftlint:disable:next force_try
                 processEffects(core.resolve(id: id, data: Data(try! fetched.bincodeSerialize())))
             }
+        case let .saveExport(export):
+            let id = request.id
+            Task {
+                let result = await Exporter.save(export)
+                // swiftlint:disable:next force_try
+                processEffects(core.resolve(id: id, data: Data(try! result.bincodeSerialize())))
+            }
         case let .notify(note):
-            Self.postNotification(title: note.title, body: note.body)
+            Self.postNotification(title: note.title, body: note.body, revealPath: note.revealPath)
         case let .clipboardWrite(write):
             let item = NSPasteboardItem()
             item.setString(write.content.text, forType: .string)
@@ -169,13 +176,23 @@ final class Core: ObservableObject {
         }
     }
 
+    /// Notifications about a saved file carry its path and a "Show in Finder"
+    /// button (see `AppDelegate`).
+    nonisolated static let revealPathKey = "revealPath"
+    nonisolated static let revealCategory = "reveal-file"
+    nonisolated static let revealAction = "show-in-finder"
+
     /// Shown only if the user allowed notifications; macOS drops it otherwise.
-    private static func postNotification(title: String, body: String) {
+    private static func postNotification(title: String, body: String, revealPath: String?) {
         guard Bundle.main.bundleURL.pathExtension == "app" else { return }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = .default
+        if let revealPath {
+            content.userInfo = [revealPathKey: revealPath]
+            content.categoryIdentifier = revealCategory
+        }
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         )

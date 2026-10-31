@@ -128,15 +128,29 @@ struct HistoryView: View {
         switch tab {
         case .saved:
             if let selected = core.view.selected {
-                ClipViewer(clip: selected)
-                    .toolbar {
-                        Button {
-                            core.update(.copyItem(selected.id))
-                        } label: {
-                            Label("Copy", systemImage: "doc.on.doc")
-                        }
-                        .help("Copy")
+                let export = { (format: ExportFormat) in core.update(.export(id: selected.id, format: format)) }
+                VStack(spacing: 14) {
+                    // The copy as a card on the window background.
+                    ClipViewer(clip: selected)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .strokeBorder(Color.primary.opacity(0.1))
+                        )
+                        .shadow(color: .black.opacity(0.08), radius: 10, y: 3)
+                    ExportBar(onExport: export)
+                }
+                .padding(20)
+                .background(Color(nsColor: .windowBackgroundColor))
+                .toolbar {
+                    Button {
+                        core.update(.copyItem(selected.id))
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
                     }
+                    .help("Copy")
+                    ExportMenu(onExport: export)
+                }
             } else {
                 ContentUnavailableView(
                     "No Selection",

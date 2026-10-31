@@ -2,6 +2,7 @@
 
 mod app;
 mod clean;
+mod export;
 pub mod ffi;
 mod store;
 

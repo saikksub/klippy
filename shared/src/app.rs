@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::{
-    clean,
+    clean, export,
     store::{KEY_BYTES, Store, preview},
 };
 
@@ -63,6 +63,18 @@ pub enum Event {
     DismissAllFailed,
     /// Copies only the plain text of a failed copy, never its HTML.
     CopyFailedText(u64),
+    /// Export a saved copy, asking the user where to save it.
+    Export {
+        id: u64,
+        format: ExportFormat,
+    },
+    /// Export straight to Downloads in the quick-export format.
+    QuickExport(u64),
+    ExportFinished {
+        result: ExportResult,
+        quick: bool,
+    },
+    SetQuickExportFormat(ExportFormat),
     /// Delete items not copied again within this long (1 minute to 365 days).
     SetRetention {
         amount: u32,
@@ -88,6 +100,31 @@ pub enum Page {
     /// Shown instead of `Home` when the app can't read the clipboard.
     Setup,
     Home,
+}
+
+#[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub enum ExportFormat {
+    #[default]
+    Pdf,
+    Html,
+    Markdown,
+}
+
+impl ExportFormat {
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Pdf => "pdf",
+            Self::Html => "html",
+            Self::Markdown => "md",
+        }
+    }
+
+    fn from_extension(name: &str) -> Option<Self> {
+        [Self::Pdf, Self::Html, Self::Markdown]
+            .into_iter()
+            .find(|format| format.extension() == name)
+    }
 }
 
 #[derive(Facet, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
@@ -255,11 +292,36 @@ impl Operation for FetchImages {
     type Output = FetchedImages;
 }
 
+/// Asks the shell to save an export. For PDF, `data` is the HTML page the
+/// shell renders into pages; for HTML and Markdown it's the file itself.
+#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SaveExport {
+    pub file_name: String,
+    pub format: ExportFormat,
+    pub data: Vec<u8>,
+    /// Show a save panel; otherwise save straight to Downloads.
+    pub ask_location: bool,
+}
+
+#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ExportResult {
+    /// Where it was saved, or `None` if cancelled or failed.
+    pub path: Option<String>,
+    /// Why it failed; empty if it didn't (including when cancelled).
+    pub error: String,
+}
+
+impl Operation for SaveExport {
+    type Output = ExportResult;
+}
+
 /// Asks the shell to show a notification (if the user allowed them).
 #[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Notify {
     pub title: String,
     pub body: String,
+    /// A file to show selected in Finder when the notification is clicked.
+    pub reveal_path: Option<String>,
 }
 
 impl Operation for Notify {
@@ -286,6 +348,7 @@ pub enum Effect {
     ClipboardRead(ClipboardRead),
     FetchImages(FetchImages),
     ClipboardWrite(ClipboardWrite),
+    SaveExport(SaveExport),
     Notify(Notify),
 }
 
@@ -331,6 +394,7 @@ pub struct Model {
     copy_trigger: u32,
     retention_amount: u32,
     retention_unit: RetentionUnit,
+    quick_export_format: ExportFormat,
     search: String,
     history_search: String,
     count: isize,
@@ -358,6 +422,7 @@ impl Default for Model {
             copy_trigger: DEFAULT_COPY_TRIGGER,
             retention_amount: DEFAULT_RETENTION_DAYS,
             retention_unit: RetentionUnit::Days,
+            quick_export_format: ExportFormat::Pdf,
             search: String::new(),
             history_search: String::new(),
             count: 0,
@@ -386,6 +451,11 @@ impl Model {
         let setting = |key| logged(self.store.setting(key)).flatten();
         if let Some(trigger) = setting("copy_trigger").and_then(|v| v.parse().ok()) {
             self.copy_trigger = clamp_trigger(trigger);
+        }
+        if let Some(format) =
+            setting("quick_export_format").and_then(|v| ExportFormat::from_extension(&v))
+        {
+            self.quick_export_format = format;
         }
         if let (Some(amount), Some(unit)) = (
             setting("retention_amount").and_then(|v| v.parse().ok()),
@@ -440,6 +510,8 @@ pub struct ViewModel {
     /// The largest `retention_amount` allowed in `retention_unit`.
     pub retention_max_amount: u32,
     pub retention_hint: String,
+    /// What the Home list's export button saves as.
+    pub quick_export_format: ExportFormat,
     /// History items matching `search`, newest first.
     pub items: Vec<ClipItem>,
     pub history_search: String,
@@ -655,6 +727,39 @@ impl App for Klippy {
                 })
                 .into();
             }
+            Event::Export { id, format } => return export(model, id, format, false),
+            Event::QuickExport(id) => {
+                let format = model.quick_export_format;
+                return export(model, id, format, true);
+            }
+            Event::ExportFinished { result, quick } => {
+                let note = match (&result.path, result.error.is_empty()) {
+                    (Some(path), _) if quick => Notify {
+                        title: "Exported".into(),
+                        body: format!(
+                            "Saved \u{201c}{}\u{201d} to Downloads.",
+                            path.rsplit('/').next().unwrap_or(path)
+                        ),
+                        reveal_path: Some(path.clone()),
+                    },
+                    (None, false) => Notify {
+                        title: "Export failed".into(),
+                        body: result.error,
+                        reveal_path: None,
+                    },
+                    // Saved via the panel (the user saw where), or cancelled.
+                    _ => return Command::done(),
+                };
+                return Command::notify_shell(note).into();
+            }
+            Event::SetQuickExportFormat(format) => {
+                model.quick_export_format = format;
+                logged(
+                    model
+                        .store
+                        .set_setting("quick_export_format", format.extension()),
+                );
+            }
             Event::SetRetention { amount, unit } => {
                 model.retention_unit = unit;
                 model.retention_amount = clamp_retention(amount, unit);
@@ -696,6 +801,7 @@ impl App for Klippy {
             retention_unit: model.retention_unit,
             retention_max_amount: model.retention_unit.max_amount(),
             retention_hint: retention_hint(model.retention_amount, model.retention_unit),
+            quick_export_format: model.quick_export_format,
             items: model.items.clone(),
             history_search: model.history_search.clone(),
             history_items: model.history_items.clone(),
@@ -759,6 +865,33 @@ fn save_copy(
     render()
 }
 
+/// Builds the export from the saved copy's sanitised HTML (or text) and asks
+/// the shell to save it.
+fn export(model: &Model, id: u64, format: ExportFormat, quick: bool) -> Command<Effect, Event> {
+    let Some(content) = logged(model.store.content(id)).flatten() else {
+        return Command::done();
+    };
+    let display = content
+        .formats
+        .iter()
+        .find(|format| format.kind == clean::DISPLAY_HTML_KIND)
+        .map(|format| String::from_utf8_lossy(&format.data).into_owned());
+    let title = preview(&content.text);
+    let data = match format {
+        ExportFormat::Pdf | ExportFormat::Html => {
+            export::html_document(&title, display.as_deref(), &content.text)
+        }
+        ExportFormat::Markdown => export::markdown(display.as_deref(), &content.text),
+    };
+    Command::request_from_shell(SaveExport {
+        file_name: export::file_name(&title, format),
+        format,
+        data: data.into_bytes(),
+        ask_location: !quick,
+    })
+    .then_send(move |result| Event::ExportFinished { result, quick })
+}
+
 /// Keeps a malicious copy's plain text in the session's Failed list instead
 /// of saving it, and tells the user.
 fn reject_copy(
@@ -782,6 +915,7 @@ fn reject_copy(
     let notify: Command<Effect, Event> = Command::notify_shell(Notify {
         title: "Can't save copy".into(),
         body: "Klippy found malicious content and didn't save it. See History → Failed.".into(),
+        reveal_path: None,
     })
     .into();
     render().and(notify)
@@ -1502,6 +1636,98 @@ mod test {
 
         let _ = Klippy.update(Event::DismissAllFailed, &mut model);
         assert!(Klippy.view(&model).failed_items.is_empty());
+    }
+
+    #[test]
+    fn export_asks_where_to_save_a_sanitised_document() {
+        let mut model = Model::default();
+        let _ = Klippy.update(
+            html_copy(r#"<h1>Report</h1><p style="color: red">body</p>"#),
+            &mut model,
+        );
+        let id = Klippy.view(&model).items[0].id;
+
+        let mut cmd = Klippy.update(
+            Event::Export {
+                id,
+                format: ExportFormat::Markdown,
+            },
+            &mut model,
+        );
+        let request = cmd.expect_one_effect().expect_save_export();
+        let save = &request.operation;
+        assert!(save.ask_location);
+        assert_eq!(save.format, ExportFormat::Markdown);
+        assert_eq!(save.file_name, "Klippy – plain words.md");
+        let markdown = String::from_utf8(save.data.clone()).unwrap();
+        assert!(markdown.contains("# Report"), "{markdown}");
+    }
+
+    #[test]
+    fn quick_export_saves_to_downloads_in_the_chosen_format_and_notifies() {
+        let mut model = Model::default();
+        let _ = Klippy.update(copied("note"), &mut model);
+        let id = Klippy.view(&model).items[0].id;
+        assert_eq!(Klippy.view(&model).quick_export_format, ExportFormat::Pdf);
+
+        let _ = Klippy.update(Event::SetQuickExportFormat(ExportFormat::Html), &mut model);
+        let mut cmd = Klippy.update(Event::QuickExport(id), &mut model);
+        let mut request = cmd.expect_one_effect().expect_save_export();
+        assert!(!request.operation.ask_location);
+        assert_eq!(request.operation.format, ExportFormat::Html);
+        assert!(String::from_utf8_lossy(&request.operation.data).contains("<pre>note</pre>"));
+
+        request
+            .resolve(ExportResult {
+                path: Some("/Users/me/Downloads/Klippy – note.html".into()),
+                error: String::new(),
+            })
+            .unwrap();
+        let event = cmd.events().next().unwrap();
+        let mut cmd = Klippy.update(event, &mut model);
+        let notify = cmd.expect_one_effect().expect_notify();
+        assert_eq!(
+            notify.operation.body,
+            "Saved \u{201c}Klippy – note.html\u{201d} to Downloads."
+        );
+        assert_eq!(
+            notify.operation.reveal_path.as_deref(),
+            Some("/Users/me/Downloads/Klippy – note.html")
+        );
+    }
+
+    #[test]
+    fn a_cancelled_export_is_silent_and_a_failed_one_notifies() {
+        let mut model = Model::default();
+        let cancelled = ExportResult {
+            path: None,
+            error: String::new(),
+        };
+        Klippy
+            .update(
+                Event::ExportFinished {
+                    result: cancelled,
+                    quick: false,
+                },
+                &mut model,
+            )
+            .expect_done();
+
+        let failed = ExportResult {
+            path: None,
+            error: "Disk full".into(),
+        };
+        let mut cmd = Klippy.update(
+            Event::ExportFinished {
+                result: failed,
+                quick: true,
+            },
+            &mut model,
+        );
+        assert_eq!(
+            cmd.expect_one_effect().expect_notify().operation.title,
+            "Export failed"
+        );
     }
 
     #[test]

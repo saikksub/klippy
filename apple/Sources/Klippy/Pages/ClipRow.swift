@@ -2,12 +2,14 @@ import App
 import SwiftUI
 
 /// A rounded card for one history item. Hovering shows a Copy button and,
-/// when `onOpen` is given, an Open button.
+/// when given, Export and Open buttons.
 struct ClipRow: View {
     let item: ClipItem
     var isSelected = false
     let onTap: () -> Void
     let onCopy: () -> Void
+    var onExport: (() -> Void)?
+    var exportHelp = "Export"
     var onOpen: (() -> Void)?
 
     @State private var isHovered = false
@@ -22,6 +24,9 @@ struct ClipRow: View {
             // Always laid out so the text doesn't reflow on hover.
             HStack(spacing: 4) {
                 RowIconButton(systemImage: justCopied ? "checkmark" : "doc.on.doc", help: "Copy", action: copy)
+                if let onExport {
+                    RowIconButton(systemImage: "square.and.arrow.down", help: exportHelp, action: onExport)
+                }
                 if let onOpen {
                     RowIconButton(systemImage: "chevron.right", help: "Open in History", action: onOpen)
                 }

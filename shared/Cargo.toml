@@ -41,6 +41,7 @@ base64 = "0.23.1"
 percent-encoding = "2.3.2"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"] }
 html5ever = "0.40"
+htmd = "0.5.6"
 
 [dev-dependencies]
 crux_core = { workspace = true, features = ["testing"] }

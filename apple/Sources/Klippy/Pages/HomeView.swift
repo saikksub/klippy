@@ -91,6 +91,8 @@ struct HomeView: View {
             item: item,
             onTap: { core.update(.copyItem(item.id)) },
             onCopy: { core.update(.copyItem(item.id)) },
+            onExport: { core.update(.quickExport(item.id)) },
+            exportHelp: "Export as \(core.view.quickExportFormat.label) to Downloads",
             onOpen: {
                 core.update(.selectItem(item.id))
                 openWindow(id: HistoryView.windowID)
