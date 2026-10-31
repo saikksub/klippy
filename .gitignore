@@ -1,5 +1,5 @@
 /target
 apple/generated
 apple/.build
-apple/build
+apple/build.noindex
 .DS_Store

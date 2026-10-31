@@ -24,7 +24,12 @@ let package = Package(
             name: "Shared",
             dependencies: ["SharedFFI"],
             path: "generated/Shared/Shared",
-            linkerSettings: [.unsafeFlags([rustLib])]
+            linkerSettings: [
+                .unsafeFlags([rustLib]),
+                // SQLCipher in the Rust core encrypts with CommonCrypto.
+                .linkedFramework("Security"),
+                .linkedFramework("CoreFoundation"),
+            ]
         ),
         .executableTarget(
             name: "Klippy",

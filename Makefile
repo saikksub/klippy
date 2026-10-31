@@ -1,6 +1,13 @@
 APPLE   := apple
 GEN     := $(APPLE)/generated
-APP_DIR := $(APPLE)/build/Klippy.app
+BUILD   := $(APPLE)/build.noindex
+APP_DIR := $(BUILD)/Klippy.app
+ASSETS  := $(APPLE)/Assets
+
+# Sign with the local identity from `make dev-cert` when it exists, so the
+# app keeps one designated requirement across rebuilds; otherwise ad hoc.
+DEV_CERT := Klippy Development
+SIGN_ID  := $(shell security find-identity -v -p codesigning 2>/dev/null | grep -q '"$(DEV_CERT)"' && echo "$(DEV_CERT)" || echo -)
 CONFIG  ?= debug
 
 # With only the Command Line Tools (no Xcode), swift test needs to be told where Swift Testing lives
@@ -19,7 +26,7 @@ RUST_PROFILE := debug
 CARGO_FLAGS  :=
 endif
 
-.PHONY: all test typegen package generate build app run open clean
+.PHONY: all test typegen package generate build icon dev-cert app run dmg open clean
 
 all: app
 
@@ -51,16 +58,47 @@ generate: typegen package
 build: generate
 	cd $(APPLE) && swift build -c $(CONFIG)
 
+# Regenerate the committed AppIcon.icns from AppIcon.svg (every size macOS wants)
+icon:
+	rm -rf $(BUILD)/AppIcon.iconset
+	mkdir -p $(BUILD)/AppIcon.iconset
+	swiftc -O $(ASSETS)/render-icon.swift -o $(BUILD)/render-icon
+	for size in 16 32 128 256 512; do \
+		$(BUILD)/render-icon $(ASSETS)/AppIcon.svg $(BUILD)/AppIcon.iconset/icon_$${size}x$${size}.png $$size; \
+		$(BUILD)/render-icon $(ASSETS)/AppIcon.svg $(BUILD)/AppIcon.iconset/icon_$${size}x$${size}@2x.png $$((size * 2)); \
+	done
+	iconutil -c icns $(BUILD)/AppIcon.iconset -o $(ASSETS)/AppIcon.icns
+
+# One-time: create the stable local signing identity (asks for your password)
+dev-cert:
+	./scripts/make-dev-cert.sh
+
 # Wrap the executable in a .app bundle
 app: build
 	rm -rf $(APP_DIR)
-	mkdir -p $(APP_DIR)/Contents/MacOS
+	mkdir -p $(APP_DIR)/Contents/MacOS $(APP_DIR)/Contents/Resources
 	cp $(APPLE)/Info.plist $(APP_DIR)/Contents/Info.plist
+	cp $(ASSETS)/AppIcon.icns $(APP_DIR)/Contents/Resources/AppIcon.icns
 	cp "$$(cd $(APPLE) && swift build -c $(CONFIG) --show-bin-path)/Klippy" $(APP_DIR)/Contents/MacOS/Klippy
-	codesign --force --sign - $(APP_DIR)
+	codesign --force --sign "$(SIGN_ID)" $(APP_DIR)
+	@[ "$(SIGN_ID)" != "-" ] || echo "note: signed ad hoc; run 'make dev-cert' once to sign with a stable local certificate"
 
 run: app
 	open $(APP_DIR)
+
+# Release disk image with the app and an Applications shortcut to drag it onto
+VERSION := $(shell /usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' $(APPLE)/Info.plist)
+DMG     := $(BUILD)/Klippy-$(VERSION).dmg
+
+dmg:
+	$(MAKE) app CONFIG=release
+	rm -rf $(BUILD)/dmg $(DMG)
+	mkdir -p $(BUILD)/dmg
+	cp -R $(APP_DIR) $(BUILD)/dmg/
+	ln -s /Applications $(BUILD)/dmg/Applications
+	hdiutil create -volname "Klippy $(VERSION)" -srcfolder $(BUILD)/dmg -fs HFS+ -format UDZO -ov $(DMG)
+	rm -rf $(BUILD)/dmg
+	@echo "built $(DMG)"
 
 # Edit the Swift shell in Xcode (opens Package.swift directly)
 open:
@@ -68,4 +106,4 @@ open:
 
 clean:
 	cargo clean
-	rm -rf $(GEN) $(APPLE)/.build $(APPLE)/build
+	rm -rf $(GEN) $(APPLE)/.build $(BUILD)
