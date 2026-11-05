@@ -11,19 +11,21 @@ use std::collections::HashMap;
 
 use crate::{
     clean, export,
-    store::{KEY_BYTES, Store, preview},
+    store::{Store, preview},
 };
 
 #[derive(Facet, Serialize, Deserialize, Clone, Debug)]
 #[repr(C)]
 pub enum Event {
-    /// Sent by the shell before `Start`: where the encrypted history lives.
-    /// Without it (e.g. in tests) history is kept in memory only.
+    /// Sent by the shell before `Start`: where the history file lives. It is
+    /// opened straight away. Without it (e.g. in tests) history is kept in
+    /// memory only.
     SetStorePath(String),
-    /// Sent by the shell once the splash screen is up, and again from the
-    /// Locked page to retry.
-    Start,
-    Unlocked(UnlockResult),
+    /// Sent by the shell once the splash screen is up. `now_ms` is unix time
+    /// in milliseconds, to clear out expired items.
+    Start {
+        now_ms: u64,
+    },
     ClipboardAccessChecked(ClipboardAccess),
     /// The user's answer to the notification permission prompt (or the stored
     /// answer on later launches).
@@ -97,8 +99,6 @@ pub enum Event {
 pub enum Page {
     #[default]
     Splash,
-    /// Touch ID was cancelled or failed; history stays encrypted.
-    Locked,
     /// Shown instead of `Home` when the app can't read the clipboard.
     Setup,
     Home,
@@ -250,25 +250,6 @@ impl RetentionUnit {
 const MAX_RETENTION_MINUTES: u64 = 365 * 24 * 60;
 const DEFAULT_RETENTION_DAYS: u32 = 30;
 
-/// Asks the shell to authenticate the user (Touch ID, or their password) and
-/// return the history's encryption key from the Keychain.
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Unlock;
-
-#[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct UnlockResult {
-    /// The 32-byte key, or `None` if authentication failed or was cancelled.
-    pub key: Option<Vec<u8>>,
-    /// Why there's no key, for the Locked page.
-    pub error: String,
-    /// Unix time in milliseconds, to clear out expired items on unlock.
-    pub now_ms: u64,
-}
-
-impl Operation for Unlock {
-    type Output = UnlockResult;
-}
-
 /// Asks the shell whether the app may read the clipboard without prompting.
 #[derive(Facet, Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ClipboardAccessCheck;
@@ -397,7 +378,6 @@ impl Operation for ClipboardWrite {
 #[derive(Debug)]
 pub enum Effect {
     Render(RenderOperation),
-    Unlock(Unlock),
     ClipboardAccess(ClipboardAccessCheck),
     NotificationPermission(NotificationPermissionRequest),
     ClipboardRead(ClipboardRead),
@@ -427,11 +407,8 @@ fn copy_window_ms(copy_trigger: u32) -> u64 {
 
 pub struct Model {
     page: Page,
-    store_path: Option<String>,
-    /// In memory until unlocked, then the encrypted file.
+    /// In memory until the shell sends `SetStorePath`, then the file.
     store: Store,
-    unlocked: bool,
-    unlock_error: String,
     clipboard_access: Option<bool>,
     notifications_allowed: Option<bool>,
     /// The lists as last read from the store (ids and previews only).
@@ -460,10 +437,7 @@ impl Default for Model {
     fn default() -> Self {
         Self {
             page: Page::default(),
-            store_path: None,
             store: Store::in_memory(),
-            unlocked: false,
-            unlock_error: String::new(),
             clipboard_access: None,
             notifications_allowed: None,
             items: Vec::new(),
@@ -557,10 +531,6 @@ pub struct SelectedClip {
 #[derive(Facet, Serialize, Deserialize, Clone, Default)]
 pub struct ViewModel {
     pub page: Page,
-    /// Whether Touch ID has unlocked the history this launch.
-    pub unlocked: bool,
-    /// Why the history is locked, on `Page::Locked`.
-    pub unlock_error: String,
     /// "true" / "false" once checked, empty before.
     pub clipboard_access: String,
     /// `None` until the permission request has been answered.
@@ -605,35 +575,15 @@ impl App for Klippy {
     fn update(&self, event: Event, model: &mut Model) -> Command<Effect, Event> {
         match event {
             Event::SetStorePath(path) => {
-                model.store_path = Some(path);
-                return Command::done();
-            }
-            Event::Start => {
-                return Command::request_from_shell(Unlock).then_send(Event::Unlocked);
-            }
-            Event::Unlocked(result) => {
-                let key = result
-                    .key
-                    .and_then(|key| <[u8; KEY_BYTES]>::try_from(key).ok());
-                let Some(key) = key else {
-                    model.page = Page::Locked;
-                    model.unlock_error = result.error;
-                    return render();
-                };
-                if let Some(path) = &model.store_path {
-                    match Store::open(path, &key) {
-                        Ok(store) => model.store = store,
-                        Err(error) => {
-                            model.page = Page::Locked;
-                            model.unlock_error = format!("Couldn't open the history: {error}");
-                            return render();
-                        }
-                    }
+                // If the file can't be opened, history stays in memory.
+                if let Some(store) = logged(Store::open(&path)) {
+                    model.store = store;
+                    model.load_settings();
+                    model.refresh();
                 }
-                model.unlocked = true;
-                model.unlock_error.clear();
-                model.load_settings();
-                model.delete_expired(result.now_ms);
+            }
+            Event::Start { now_ms } => {
+                model.delete_expired(now_ms);
                 model.refresh();
                 return Command::request_from_shell(ClipboardAccessCheck)
                     .then_send(Event::ClipboardAccessChecked);
@@ -806,7 +756,7 @@ impl App for Klippy {
                         title: "Exported".into(),
                         body: format!(
                             "Saved \u{201c}{}\u{201d} to Downloads.",
-                            path.rsplit('/').next().unwrap_or(path)
+                            path.rsplit(['/', '\\']).next().unwrap_or(path)
                         ),
                         reveal_path: Some(path.clone()),
                     },
@@ -859,8 +809,6 @@ impl App for Klippy {
     fn view(&self, model: &Model) -> ViewModel {
         ViewModel {
             page: model.page.clone(),
-            unlocked: model.unlocked,
-            unlock_error: model.unlock_error.clone(),
             notifications_allowed: model.notifications_allowed,
             clipboard_access: model
                 .clipboard_access
@@ -1037,46 +985,14 @@ mod test {
         assert_eq!(Klippy.view(&model).page, Page::Splash);
     }
 
-    const KEY: [u8; KEY_BYTES] = [9; KEY_BYTES];
-
-    /// Runs `Start` through a successful Touch ID unlock, returning the
-    /// command that then asks for clipboard access.
-    fn start_and_unlock(model: &mut Model, now_ms: u64) -> Command<Effect, Event> {
-        let mut cmd = Klippy.update(Event::Start, model);
-        let mut request = cmd.expect_one_effect().expect_unlock();
-        request
-            .resolve(UnlockResult {
-                key: Some(KEY.to_vec()),
-                error: String::new(),
-                now_ms,
-            })
-            .unwrap();
-        let event = cmd.events().next().unwrap();
-        Klippy.update(event, model)
+    /// Runs `Start`, returning the command that then asks for clipboard
+    /// access.
+    fn start(model: &mut Model, now_ms: u64) -> Command<Effect, Event> {
+        Klippy.update(Event::Start { now_ms }, model)
     }
 
     #[test]
-    fn start_asks_for_touch_id_and_stays_locked_without_it() {
-        let mut model = Model::default();
-        let mut cmd = Klippy.update(Event::Start, &mut model);
-        let mut request = cmd.expect_one_effect().expect_unlock();
-        request
-            .resolve(UnlockResult {
-                key: None,
-                error: "Cancelled".into(),
-                now_ms: 0,
-            })
-            .unwrap();
-        let event = cmd.events().next().unwrap();
-        Klippy.update(event, &mut model).expect_only_render();
-
-        let view = Klippy.view(&model);
-        assert_eq!(view.page, Page::Locked);
-        assert_eq!(view.unlock_error, "Cancelled");
-    }
-
-    #[test]
-    fn unlocking_opens_the_encrypted_file_with_saved_history_and_settings() {
+    fn opens_the_history_file_with_saved_history_and_settings() {
         let path = std::env::temp_dir().join(format!("klippy-app-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let launch = || {
@@ -1085,7 +1001,7 @@ mod test {
                 Event::SetStorePath(path.to_string_lossy().into()),
                 &mut model,
             );
-            let _ = start_and_unlock(&mut model, 1_000);
+            let _ = start(&mut model, 1_000);
             model
         };
 
@@ -1114,30 +1030,9 @@ mod test {
     }
 
     #[test]
-    fn a_wrong_key_keeps_the_history_locked() {
-        let path =
-            std::env::temp_dir().join(format!("klippy-wrongkey-{}.sqlite", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        drop(Store::open(&path, &[1; KEY_BYTES]).unwrap());
-
+    fn the_tray_gets_the_newest_items() {
         let mut model = Model::default();
-        let _ = Klippy.update(
-            Event::SetStorePath(path.to_string_lossy().into()),
-            &mut model,
-        );
-        let _ = start_and_unlock(&mut model, 0);
-        let view = Klippy.view(&model);
-        assert_eq!(view.page, Page::Locked);
-        assert!(view.unlock_error.starts_with("Couldn't open the history"));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn the_tray_gets_the_newest_items_only_once_unlocked() {
-        let mut model = Model::default();
-        assert!(!Klippy.view(&model).unlocked);
-        let _ = start_and_unlock(&mut model, 0);
-        assert!(Klippy.view(&model).unlocked);
+        let _ = start(&mut model, 0);
 
         for i in 0..TRAY_ITEMS + 5 {
             let _ = Klippy.update(copied(&format!("item {i}")), &mut model);
@@ -1225,7 +1120,7 @@ mod test {
     #[test]
     fn start_checks_clipboard_access_then_shows_home() {
         let mut model = Model::default();
-        let mut cmd = start_and_unlock(&mut model, 0);
+        let mut cmd = start(&mut model, 0);
         let mut request = cmd.expect_one_effect().expect_clipboard_access();
         request.resolve(ClipboardAccess { granted: true }).unwrap();
 
@@ -1488,7 +1383,7 @@ mod test {
     #[test]
     fn start_shows_setup_when_clipboard_access_is_denied() {
         let mut model = Model::default();
-        let mut cmd = start_and_unlock(&mut model, 0);
+        let mut cmd = start(&mut model, 0);
         let mut request = cmd.expect_one_effect().expect_clipboard_access();
         request.resolve(ClipboardAccess { granted: false }).unwrap();
 
@@ -1805,6 +1700,24 @@ mod test {
         assert_eq!(
             notify.operation.reveal_path.as_deref(),
             Some("/Users/me/Downloads/Klippy – note.html")
+        );
+    }
+
+    #[test]
+    fn quick_export_notification_names_the_file_in_a_windows_path() {
+        let mut model = Model::default();
+        let event = Event::ExportFinished {
+            result: ExportResult {
+                path: Some(r"C:\Users\me\Downloads\Klippy – note.pdf".into()),
+                error: String::new(),
+            },
+            quick: true,
+        };
+        let mut cmd = Klippy.update(event, &mut model);
+        let notify = cmd.expect_one_effect().expect_notify();
+        assert_eq!(
+            notify.operation.body,
+            "Saved \u{201c}Klippy – note.pdf\u{201d} to Downloads."
         );
     }
 

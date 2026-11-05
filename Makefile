@@ -26,7 +26,7 @@ RUST_PROFILE := debug
 CARGO_FLAGS  :=
 endif
 
-.PHONY: all test typegen package generate build icon dev-cert app run dmg open clean
+.PHONY: all test typegen package generate build icon windows-icon dev-cert app run dmg open clean
 
 all: app
 
@@ -69,6 +69,17 @@ icon:
 	done
 	iconutil -c icns $(BUILD)/AppIcon.iconset -o $(ASSETS)/AppIcon.icns
 
+# Regenerate the committed windows/assets/Klippy.ico from AppIcon.svg
+ICO_SIZES := 16 20 24 32 40 48 64 256
+windows-icon:
+	rm -rf $(BUILD)/ico
+	mkdir -p $(BUILD)/ico
+	swiftc -O $(ASSETS)/render-icon.swift -o $(BUILD)/render-icon
+	for size in $(ICO_SIZES); do \
+		$(BUILD)/render-icon $(ASSETS)/AppIcon.svg $(BUILD)/ico/icon-$$size.png $$size; \
+	done
+	python3 scripts/png-to-ico.py windows/assets/Klippy.ico $(foreach size,$(ICO_SIZES),$(BUILD)/ico/icon-$(size).png)
+
 # One-time: create the stable local signing identity (asks for your password)
 dev-cert:
 	./scripts/make-dev-cert.sh
@@ -106,4 +117,4 @@ open:
 
 clean:
 	cargo clean
-	rm -rf $(GEN) $(APPLE)/.build $(BUILD)
+	rm -rf $(GEN) $(APPLE)/.build $(BUILD) windows/dist

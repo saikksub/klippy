@@ -11,14 +11,11 @@ final class Core: ObservableObject {
     private var clipboardWatcher: Task<Void, Never>?
     private var watchActivity: NSObjectProtocol?
     private var lastChangeCount = 0
-    private let inMemory: Bool
     private var expiryTimer: Task<Void, Never>?
 
-    /// `storePath` is the encrypted history file; nil keeps history in memory
-    /// and skips Touch ID (for tests).
+    /// `storePath` is the history file; nil keeps history in memory (for tests).
     init(storePath: String? = nil) {
         core = CoreFfi()
-        inMemory = storePath == nil
         // swiftlint:disable:next force_try
         view = try! .bincodeDeserialize(input: [UInt8](core.view()))
         if let storePath {
@@ -40,7 +37,7 @@ final class Core: ObservableObject {
     }
 
     /// Unix time in milliseconds.
-    private static var nowMs: UInt64 { UInt64(Date().timeIntervalSince1970 * 1000) }
+    static var nowMs: UInt64 { UInt64(Date().timeIntervalSince1970 * 1000) }
 
     /// Lets the core delete items older than the retention setting.
     private func startExpiryTimer() {
@@ -115,23 +112,6 @@ final class Core: ObservableObject {
         case .render:
             // swiftlint:disable:next force_try
             view = try! .bincodeDeserialize(input: [UInt8](core.view()))
-        case .unlock:
-            if inMemory {
-                // Tests: nothing on disk to protect, so no Touch ID.
-                let result = UnlockResult(key: [UInt8](repeating: 0, count: 32), error: "", nowMs: Self.nowMs)
-                // swiftlint:disable:next force_try
-                processEffects(core.resolve(id: request.id, data: Data(try! result.bincodeSerialize())))
-                return
-            }
-            let id = request.id
-            Task {
-                let result = switch await HistoryKey.unlock() {
-                case let .success(key): UnlockResult(key: key, error: "", nowMs: Self.nowMs)
-                case let .failure(failure): UnlockResult(key: nil, error: failure.message, nowMs: Self.nowMs)
-                }
-                // swiftlint:disable:next force_try
-                processEffects(core.resolve(id: id, data: Data(try! result.bincodeSerialize())))
-            }
         case .clipboardAccess:
             let access = ClipboardAccess(granted: Self.canReadClipboard())
             // swiftlint:disable:next force_try

@@ -1,6 +1,4 @@
-//! Persistent clipboard history in SQLite, encrypted with SQLCipher
-//! (AES-256, via Apple's CommonCrypto). The key comes from the shell, which
-//! keeps it in the Keychain behind Touch ID.
+//! Persistent clipboard history in SQLite.
 //!
 //! The list only ever needs `id` and a short `preview`, so those live in the
 //! small `clips` table and are all the app keeps in memory. The heavy formats
@@ -23,23 +21,15 @@ const PREVIEW_CHARS: usize = 300;
 /// 2 added `clips.appearance`.
 const SCHEMA_VERSION: i32 = 2;
 
-/// SQLCipher's raw key size: 256 bits.
-pub const KEY_BYTES: usize = 32;
-
 pub struct Store {
     // `Connection` isn't `Sync`; the core needs the model to be.
     conn: Mutex<Connection>,
 }
 
 impl Store {
-    /// Opens (or creates) the encrypted database. Fails if `key` is wrong.
-    pub fn open(path: impl AsRef<Path>, key: &[u8; KEY_BYTES]) -> rusqlite::Result<Self> {
-        let conn = Connection::open(path)?;
-        // A raw key (`x'…'`) skips SQLCipher's password stretching; it must be
-        // set before anything else touches the file.
-        let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
-        conn.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";"))?;
-        Self::new(conn)
+    /// Opens (or creates) the database.
+    pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
+        Self::new(Connection::open(path)?)
     }
 
     /// For tests, and as a fallback when the file can't be opened.
@@ -355,37 +345,15 @@ mod test {
         path
     }
 
-    const KEY: [u8; KEY_BYTES] = [7; KEY_BYTES];
-
-    #[test]
-    fn the_file_is_encrypted_and_needs_the_right_key() {
-        let path = temp_path("encrypted");
-        Store::open(&path, &KEY)
-            .unwrap()
-            .add(&content("secret words"), 1)
-            .unwrap();
-
-        let bytes = std::fs::read(&path).unwrap();
-        let plain = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
-        assert!(!plain(b"SQLite format 3"), "header should be encrypted");
-        assert!(!plain(b"secret words"), "text should be encrypted");
-
-        assert!(
-            Store::open(&path, &[8; KEY_BYTES]).is_err(),
-            "wrong key must fail"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
     #[test]
     fn history_survives_reopening_the_file() {
         let path = temp_path("reopen");
         {
-            let store = Store::open(&path, &KEY).unwrap();
+            let store = Store::open(&path).unwrap();
             store.add(&content("kept"), 1).unwrap();
             store.set_setting("copy_trigger", "2").unwrap();
         }
-        let store = Store::open(&path, &KEY).unwrap();
+        let store = Store::open(&path).unwrap();
         assert_eq!(previews(&store, ""), ["kept"]);
         let id = store.list("").unwrap()[0].id;
         assert_eq!(store.content(id).unwrap(), Some(content("kept")));

@@ -9,9 +9,7 @@ struct ContentView: View {
         switch core.view.page {
         case .splash:
             SplashView()
-                .task { core.update(.start) }
-        case .locked:
-            LockedView(core: core)
+                .task { core.update(.start(nowMs: Core.nowMs)) }
         case .setup:
             SetupView()
         case .home:
