@@ -1,6 +1,7 @@
 # Klippy
 
-A clipboard history for macOS that lives in the menu bar and saves only what you ask it to.
+A clipboard history for macOS and Windows that lives in the menu bar (or the Windows tray) and
+saves only what you ask it to. See [Windows](#windows) for how the Windows version differs.
 
 Most clipboard managers record everything you copy, including passwords, one-time codes and
 private messages. Klippy records nothing by default. To save something, **copy it three times
@@ -25,15 +26,10 @@ history.
 
 ## How it keeps your data safe
 
-### Your history is encrypted and locked behind Touch ID
-- The history is a SQLite database encrypted with **SQLCipher (AES-256)**, stored at
-  `~/Library/Application Support/Klippy/history.sqlite` in a folder only your user can read
-  (`0700`). Without the key, the file is unreadable, including its header.
-- The 256-bit key is generated at random on first launch and kept in your **login
-  Keychain**. The Keychain item is marked *this device only, when unlocked*, so it isn't
-  synced or included in backups.
-- Klippy asks for **Touch ID (or your login password)** before it takes the key out of the
-  Keychain. If you cancel, the history stays locked and nothing is read or saved.
+### Where your history is stored
+- The history is a SQLite database at `~/Library/Application Support/Klippy/history.sqlite`,
+  in a folder only your user can read (`0700`). It is **not encrypted**: any program running
+  as you can read it.
 - Deleted items are overwritten on disk (`secure_delete`), and *Clear History* also compacts
   the file.
 
@@ -84,16 +80,14 @@ The image host can see that the image was downloaded, just as it would if you op
 - **Klippy isn't sandboxed or notarized.** You build it yourself, and it is signed with a
   local certificate (`make dev-cert`), not an Apple Developer ID. The source is in this repo
   for you to check.
-- **Touch ID is enforced by Klippy, not by macOS.** Another app trying to read the Keychain
-  item still triggers the usual macOS Keychain prompt.
+- **The history file isn't encrypted.** Anything that can read your user's files can read
+  your saved copies.
 
 ## Permissions
 
 | Permission | Why | Required? |
 | --- | --- | --- |
 | **Paste from Other Apps** (Privacy & Security), set to *Always Allow* | Reading the clipboard after a triple copy without a prompt each time | Yes. If it isn't set, Klippy shows a setup page |
-| **Touch ID / login password** | Unlocking the history's key | Yes, once per launch |
-| **Keychain access**: choose *Always Allow* | Storing the history key | Yes, the first time |
 | **Notifications** | Telling you when a copy is rejected or an export is saved | Optional |
 | **Login Items** | Launch at login | Optional |
 
@@ -113,19 +107,54 @@ install any that are missing.
 Run Klippy from `/Applications`, not `apple/build.noindex/`. `make app` and `make clean` delete
 `apple/build.noindex`, which would break launch at login.
 
-After each new build, macOS asks **twice** for access to the "Klippy history encryption key"
-the first time Klippy runs. Enter your password and choose **Always Allow** both times. It
-happens because Keychain ties the key to the build's code hash: a self-signed certificate has no
-Apple Team ID, so a signature that stays the same across builds would need an Apple Developer ID.
+## Windows
+
+Klippy for Windows (10 and 11, x64) runs the same Rust core as the Mac app, so the copy trigger,
+cleaning, rejection of malicious HTML, retention and exports behave the same. Save a copy with
+**Ctrl+C three times in quick succession**. Klippy lives in the notification area: left-click the
+paperclip to open it, or right-click it for History, Settings and Quit.
+
+### Build and run
+
+On a Windows PC with [Rust](https://rustup.rs) (MSVC toolchain, with the Visual Studio C++ Build
+Tools):
+
+```powershell
+.\scripts\build-windows.ps1   # builds windows\dist\Klippy.exe; run it again to update
+```
+
+`Klippy.exe` is a single file with nothing to install alongside it (WebView2 comes with Windows).
+Keep it in a folder you won't move, because launch at login starts it from there. Without a
+Windows PC, the [Windows workflow](.github/workflows/windows.yml) builds the exe on every push to
+`main`; download it from the run's **Klippy-windows-x64** artifact.
+
+The exe isn't code-signed, so SmartScreen warns the first time you run it: choose
+*More info → Run anyway*.
+
+### How it differs from the Mac app
+
+| | macOS | Windows |
+| --- | --- | --- |
+| History file | `~/Library/Application Support/Klippy/` | `%LOCALAPPDATA%\Klippy\history.sqlite` |
+| Change detection | Pasteboard change count | Clipboard sequence number (`GetClipboardSequenceNumber`), which doesn't open the clipboard |
+| Private copies skipped | nspasteboard.org markers | `ExcludeClipboardContentFromMonitorProcessing`, `Clipboard Viewer Ignore` and `CanIncludeInClipboardHistory = 0`, which password managers set |
+| Formats kept | Every pasteboard type | Text, HTML and RTF |
+| Preview | Locked-down WKWebView | WebView2 page with the copy in a fully sandboxed `<iframe>` (no scripts, no navigation) under a Content-Security-Policy that blocks all loading |
+| PDF export | WebKit printing | WebView2's PDF printer, with JavaScript off |
+| Image downloads | URLSession, ephemeral | HTTPS only, no cookies, through Windows' own TLS (Schannel) |
+| Launch at login | Login Items | The per-user `Run` key; you can turn it off in Settings → Apps → Startup |
+| Notifications | Notification Center | Toast notifications |
+| Clipboard permission | *Paste from Other Apps* | None needed |
 
 ## Development
 
 Klippy is a [Crux](https://github.com/redbadger/crux) app: the behaviour lives in a Rust core
-(`shared/`), and a SwiftUI shell (`apple/`) runs it as a native macOS desktop app.
+(`shared/`). A SwiftUI shell (`apple/`) runs it as a native macOS app, and a Rust shell
+(`windows/`) runs it on Windows.
 
 ```
 shared/            Rust core: Event, Model, ViewModel, Effect, update/view (src/app.rs)
-  src/store.rs     encrypted history (SQLCipher)
+  src/store.rs     history (SQLite)
   src/clean.rs     threat detection, HTML sanitising, image cleaning
   src/export.rs    PDF / HTML / Markdown export
   src/ffi.rs       CoreFfi, the bytes-in/bytes-out interface exported via BoltFFI
@@ -133,7 +162,16 @@ shared/            Rust core: Event, Model, ViewModel, Effect, update/view (src/
 apple/             SwiftUI macOS shell (Swift Package, no Xcode project)
   Sources/Klippy   App entry point, Core (effect loop), ContentView
   generated/       build output of `make generate`, not checked in
+windows/           Windows shell (Rust: tao windows, wry/WebView2, tray-icon)
+  src/shell.rs     event loop: runs the core and carries out its effects
+  src/clipboard.rs Win32 clipboard, mapped to the core's `public.html` / `public.rtf`
+  ui/              the windows' HTML, CSS and JavaScript, embedded in the exe
 ```
+
+The Windows shell links the core as a Rust crate, so it needs no FFI or generated types. Its pages
+send the core's `Event`s as JSON and get the `ViewModel` back as JSON. Only the events a control
+can trigger are accepted from a page. `make windows-icon` regenerates `windows/assets/Klippy.ico`
+from `AppIcon.svg` (on a Mac).
 
 ## Prerequisites
 
@@ -141,6 +179,7 @@ apple/             SwiftUI macOS shell (Swift Package, no Xcode project)
 - BoltFFI CLI, matching the `boltffi` crate version:
   `cargo install boltffi_cli --version '=0.30.1' --locked`
 - Swift 5.9+ (Xcode Command Line Tools are enough; full Xcode is optional)
+- For Windows: see [Build and run](#build-and-run)
 
 ## Commands
 

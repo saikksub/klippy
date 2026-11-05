@@ -45,7 +45,7 @@ struct ClearHistoryView: View {
                     .buttonStyle(.borderedProminent)
                     .tint(.red)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(!isConfirmed || !core.view.unlocked)
+                    .disabled(!isConfirmed)
             }
         }
         .padding(20)
@@ -54,7 +54,7 @@ struct ClearHistoryView: View {
     }
 
     private func deleteIfConfirmed() {
-        guard isConfirmed, core.view.unlocked else { return }
+        guard isConfirmed else { return }
         core.update(.clearHistory)
         dismiss()
     }
@@ -70,6 +70,5 @@ struct ClearHistoryMenuItem: View {
             openWindow(id: ClearHistoryView.windowID)
             NSApp.activate(ignoringOtherApps: true)
         }
-        .disabled(!core.view.unlocked)
     }
 }

@@ -45,9 +45,9 @@ pub fn html_document(title: &str, display_html: Option<&str>, text: &str) -> Str
 <meta name="generator" content="Klippy">
 <title>{title}</title>
 <style>
-body {{ font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; color: #1d1d1f; max-width: 760px; margin: 40px auto; padding: 0 24px; }}
+body {{ font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", sans-serif; color: #1d1d1f; max-width: 760px; margin: 40px auto; padding: 0 24px; }}
 img {{ max-width: 100%; height: auto; }}
-pre {{ white-space: pre-wrap; word-wrap: break-word; font: 13px/1.5 ui-monospace, Menlo, monospace; }}
+pre {{ white-space: pre-wrap; word-wrap: break-word; font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace; }}
 table {{ border-collapse: collapse; }}
 td, th {{ padding: 4px 8px; }}
 </style>

@@ -1,5 +1,6 @@
 [workspace]
-members = ["shared"]
+members = ["shared", "windows"]
+default-members = ["shared"]
 resolver = "3"
 
 [workspace.package]

@@ -26,9 +26,6 @@ let package = Package(
             path: "generated/Shared/Shared",
             linkerSettings: [
                 .unsafeFlags([rustLib]),
-                // SQLCipher in the Rust core encrypts with CommonCrypto.
-                .linkedFramework("Security"),
-                .linkedFramework("CoreFoundation"),
             ]
         ),
         .executableTarget(

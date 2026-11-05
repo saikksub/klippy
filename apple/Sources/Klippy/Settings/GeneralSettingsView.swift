@@ -40,8 +40,6 @@ struct GeneralSettingsView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-            // Saved in the encrypted history, so only editable once unlocked.
-            .disabled(!core.view.unlocked)
 
             Section {
                 Picker("Delete items older than", selection: retentionChoice) {
@@ -76,7 +74,6 @@ struct GeneralSettingsView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-            .disabled(!core.view.unlocked)
 
             Section {
                 Picker("Quick export format", selection: Binding(
@@ -92,7 +89,6 @@ struct GeneralSettingsView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-            .disabled(!core.view.unlocked)
 
             Section {
                 Picker("Clicking a menu bar history item", selection: Binding(
@@ -107,7 +103,6 @@ struct GeneralSettingsView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-            .disabled(!core.view.unlocked)
 
             Section {
                 LabeledContent("Saved copies") {
@@ -116,7 +111,6 @@ struct GeneralSettingsView: View {
                     }
                 }
             }
-            .disabled(!core.view.unlocked)
 
             Section {
                 LabeledContent("Notifications") {

@@ -1,10 +1,6 @@
 #!/bin/sh
 # Builds a release Klippy and installs it to /Applications, replacing (and
 # relaunching) any copy already there. Run it again to update.
-#
-# Each new build has a new code hash, so macOS asks twice for Keychain access
-# the first time it runs; enter your password and choose Always Allow both
-# times.
 set -eu
 
 cd "$(dirname "$0")/.."

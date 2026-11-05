@@ -1,9 +1,7 @@
 #!/bin/sh
 # Creates a self-signed "Klippy Development" code-signing identity in the
 # login keychain. Signing every local build with it keeps Klippy's designated
-# requirement stable (ad-hoc signatures change every build). Keychain still
-# asks again after each rebuild: without an Apple Team ID, an item's partition
-# list can only name a build's code hash.
+# requirement stable (ad-hoc signatures change every build).
 set -eu
 
 NAME="Klippy Development"

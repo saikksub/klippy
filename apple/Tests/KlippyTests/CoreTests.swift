@@ -25,8 +25,7 @@ struct CoreTests {
         let core = Core()
         #expect(core.view.clipboardAccess == "")
 
-        core.update(.start)
-        #expect(core.view.unlocked)
+        core.update(.start(nowMs: 0))
         #expect(core.view.page == (core.view.clipboardAccess == "true" ? .home : .setup))
         #expect(["true", "false"].contains(core.view.clipboardAccess))
     }

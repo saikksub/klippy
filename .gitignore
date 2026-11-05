@@ -3,3 +3,4 @@ apple/generated
 apple/.build
 apple/build.noindex
 .DS_Store
+windows/dist

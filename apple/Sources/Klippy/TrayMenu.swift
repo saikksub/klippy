@@ -12,28 +12,25 @@ struct TrayMenu: View {
 
     var body: some View {
         Button("Show Klippy") { show(KlippyApp.mainWindowID) }
-        // Only once Touch ID has unlocked the history.
-        if core.view.unlocked {
-            Menu("History") {
-                if core.view.recentItems.isEmpty {
-                    Text("Nothing copied yet")
-                }
-                // The newest items only: menus build every row up front, so
-                // the full history lives in the History window.
-                ForEach(core.view.recentItems, id: \.id) { item in
-                    Button(Self.title(item.preview)) { open(item) }
-                }
-                Divider()
-                Button("Show All History…") { show(HistoryView.windowID) }
-                if !core.view.failedItems.isEmpty {
-                    Button("Failed to Save (\(core.view.failedItems.count))…") {
-                        core.update(.setHistoryTab(.failed))
-                        show(HistoryView.windowID)
-                    }
-                }
-                Divider()
-                Button("Clear History…") { show(ClearHistoryView.windowID) }
+        Menu("History") {
+            if core.view.recentItems.isEmpty {
+                Text("Nothing copied yet")
             }
+            // The newest items only: menus build every row up front, so
+            // the full history lives in the History window.
+            ForEach(core.view.recentItems, id: \.id) { item in
+                Button(Self.title(item.preview)) { open(item) }
+            }
+            Divider()
+            Button("Show All History…") { show(HistoryView.windowID) }
+            if !core.view.failedItems.isEmpty {
+                Button("Failed to Save (\(core.view.failedItems.count))…") {
+                    core.update(.setHistoryTab(.failed))
+                    show(HistoryView.windowID)
+                }
+            }
+            Divider()
+            Button("Clear History…") { show(ClearHistoryView.windowID) }
         }
         Divider()
         Button("About Klippy", action: AboutPanel.show)
